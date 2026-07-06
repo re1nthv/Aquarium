@@ -4,12 +4,12 @@ Parent: [progress_tracker/](../README.md)
 
 | Sub-module | Status | Notes |
 |---|---|---|
-| slack | 🟡 In Progress | Trigger mechanism + schema defined; not yet implemented |
-| gus | 🟡 In Progress | Trigger mechanism + schema defined; not yet implemented |
-| google_workspace | 🟡 In Progress | Trigger mechanism + schema + ready convention defined; not yet implemented |
-| signal_classifier | 🟡 In Progress | Full processing pipeline defined (pre-filter → dedup → LLM → forward); not yet implemented |
+| slack | 🟢 Complete | Implemented + 17 tests passing |
+| gus | 🟢 Complete | Implemented + 23 tests passing |
+| google_workspace | 🟢 Complete | Implemented + 25 tests passing |
+| signal_classifier | 🟢 Complete | Implemented + 27 tests passing |
 
-**Layer status: 🟡 In Progress**
+**Layer status: 🟢 Complete — 92/92 tests passing**
 
 ---
 

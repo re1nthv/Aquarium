@@ -10,7 +10,7 @@ See [CHANGELOG.md](CHANGELOG.md) for a running log of every change.
 
 | Layer | Status | Sub-modules |
 |---|---|---|
-| [Feed Layer](feed_layer/README.md) | 🟡 In Progress | 0 / 4 complete (4 / 4 designed) |
+| [Feed Layer](feed_layer/README.md) | 🟢 Complete | 4 / 4 complete — 92 tests passing |
 | [Task Management Layer](task_management_layer/README.md) | 🔴 Not Started | 0 / 7 complete |
 | [Task Executor Layer](task_executor_layer/README.md) | 🔴 Not Started | 0 / 4 complete |
 | [Judgement Layer](judgement_layer/README.md) | 🔴 Not Started | 0 / 3 complete |
@@ -30,15 +30,15 @@ See [CHANGELOG.md](CHANGELOG.md) for a running log of every change.
 
 ---
 
-## Feed Layer — 🟡 In Progress
+## Feed Layer — 🟢 Complete
 [Full detail →](feed_layer/README.md)
 
 | Sub-module | Status |
 |---|---|
-| slack | 🟡 In Progress — design complete, implementation pending |
-| gus | 🟡 In Progress — design complete, implementation pending |
-| google_workspace | 🟡 In Progress — design complete, implementation pending |
-| signal_classifier | 🟡 In Progress — design complete, implementation pending |
+| slack | 🟢 Complete — 17 tests passing |
+| gus | 🟢 Complete — 23 tests passing |
+| google_workspace | 🟢 Complete — 25 tests passing |
+| signal_classifier | 🟢 Complete — 27 tests passing |
 
 ---
 

@@ -8,6 +8,12 @@ Format: `[YYYY-MM-DD] [layer/sub-module] [type: design | impl | fix | refactor |
 
 ## Log
 
+- [2026-07-06] [feed_layer/slack] [impl] — Implemented connector.py (Flask, reaction_added/removed toggle + bot_message via is_bot flag, async enqueue, 503 on queue failure). 17/17 tests passing.
+- [2026-07-06] [feed_layer/gus] [impl] — Implemented connector.py (webhook handler + GusPoller with durable cursor, rapid-update collapse, crash-safe watermark). 23/23 tests passing.
+- [2026-07-06] [feed_layer/google_workspace] [impl] — Implemented connector.py (Drive watch + polling fallback, [READY] gate, 5-min dedup, WatchChannelRenewer, 403 handling). 25/25 tests passing.
+- [2026-07-06] [feed_layer/signal_classifier] [impl] — Implemented classifier.py (pre-filter → semantic dedup → LLM classify → route, retry backoff, token budget, human review queue, 10 metrics). 27/27 tests passing.
+- [2026-07-06] [feed_layer/shared] [impl] — Canonical Signal schema v1.0, MessageQueue ABC, InMemoryQueue written as shared contract for all connectors.
+
 - [2026-07-06] [feed_layer/signal_classifier] [design] — Full processing pipeline defined: rule-based pre-filter → semantic dedup (embedding cosine similarity, 2h window) → LLM classification (versioned prompt, daily token budget, fallback) → forward/park. Human review queue with 4h SLA and feedback loop specified. 14 observability metrics defined.
 - [2026-07-06] [feed_layer/google_workspace] [design] — Trigger mechanism defined: Drive API watch + polling fallback. Ready convention resolved: intake folder + `[READY]` title suffix (both required). Service account auth, 403 handling, and watch renewal job specified.
 - [2026-07-06] [feed_layer/gus] [design] — Trigger mechanism defined: webhooks for epic/TD/escalation/task.blocked, polling fallback with durable cursor (5min interval, crash recovery, overlap guard, rate limit), manual `aquarium-intake` label path. Signal schema v1.0 and 60s update collapse specified.
