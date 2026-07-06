@@ -94,6 +94,16 @@ Key sub-modules: `task_status`, `epic_status`, `delivery_tracker`
 
 ---
 
+## Development Progress
+
+Implementation status for every sub-module is tracked in [`progress_tracker/`](progress_tracker/README.md). Any change to a sub-module's status propagates up through the layer dashboard to the root dashboard there.
+
+Current overall status: **🔴 0 / 18 sub-modules implemented**
+
+See [`progress_tracker/CHANGELOG.md`](progress_tracker/CHANGELOG.md) for a full log of every design, structural, and implementation change.
+
+---
+
 ## Design Principles
 
 - **Human in the loop at every layer** — no layer is fully autonomous by default. Manual review surfaces are built in throughout.
