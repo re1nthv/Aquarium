@@ -1,0 +1,7 @@
+"""
+Configuration constants for the GUS connector.
+"""
+
+POLLING_INTERVAL_SECONDS = 300
+MAX_REQUESTS_PER_SECOND = 10
+RAPID_UPDATE_WINDOW_SECONDS = 60

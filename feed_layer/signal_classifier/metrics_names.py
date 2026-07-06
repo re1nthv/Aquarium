@@ -1,0 +1,12 @@
+"""Metric name constants for the Signal Classifier."""
+
+SIGNALS_INGESTED = "signals.ingested"
+SIGNALS_PRE_FILTER_DROPPED = "signals.pre_filter_dropped"
+SIGNALS_DEDUPLICATED = "signals.deduplicated"
+SIGNALS_CLASSIFIED_RELEVANT = "signals.classified.relevant"
+SIGNALS_CLASSIFIED_IRRELEVANT = "signals.classified.irrelevant"
+SIGNALS_CLASSIFIED_UNCERTAIN = "signals.classified.uncertain"
+UNCERTAIN_QUEUE_DEPTH = "signals.uncertain_queue.depth"
+UNCERTAIN_QUEUE_AGE_P90 = "signals.uncertain_queue.age_p90"
+LLM_TOKENS_USED = "classifier.llm_tokens_used"
+LLM_FALLBACK_COUNT = "classifier.llm_fallback_count"
