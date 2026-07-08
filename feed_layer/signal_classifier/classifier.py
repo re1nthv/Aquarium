@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from feed_layer.control_plane import NullObserver, SignalObserver
 from feed_layer.shared import (
     Classification,
     MessageQueue,
@@ -388,6 +389,7 @@ class SignalClassifier:
         human_queue: HumanReviewQueue,
         metrics: MetricsCollector,
         config: ClassifierConfig,
+        observer: Optional[SignalObserver] = None,
     ) -> None:
         self._input = input_queue
         self._output = output_queue
@@ -397,6 +399,9 @@ class SignalClassifier:
         self._human = human_queue
         self._metrics = metrics
         self._config = config
+        # Optional dashboard hook — defaults to a no-op so existing wiring
+        # (and all pre-existing tests) sees identical behaviour.
+        self._observer: SignalObserver = observer if observer is not None else NullObserver()
 
     # ------------------------------------------------------------------
     # Public API
@@ -462,6 +467,7 @@ class SignalClassifier:
                 pre_filter_hit="stale",
             )
             self._human.add(signal, reason="stale")
+            self._observer.on_parked(signal, "stale")
             return True, None  # parked, not silently dropped
 
         return False, None
@@ -505,6 +511,7 @@ class SignalClassifier:
         if self._config.daily_token_budget_remaining() == 0:
             # Park back in input queue with a delay — not dropped
             self._input.enqueue(signal)
+            self._observer.on_parked(signal, "budget_exhausted")
             return None, 0, None
 
         delays = [1, 2, 4]
@@ -538,6 +545,7 @@ class SignalClassifier:
         # All retries exhausted
         self._human.add(signal, reason="llm_unavailable")
         self._metrics.increment(LLM_FALLBACK_COUNT)
+        self._observer.on_parked(signal, "llm_unavailable")
         return None, 0, None
 
     # ------------------------------------------------------------------
@@ -546,6 +554,9 @@ class SignalClassifier:
 
     def _process_one(self, signal: Signal) -> None:
         """Run the full 4-step pipeline for a single signal."""
+        # Signal detected — first observer touchpoint for this signal.
+        self._observer.on_detected(signal)
+
         # Emit ingested metric by source
         self._metrics.increment(
             SIGNALS_INGESTED, tags={"source": signal.source}
@@ -566,9 +577,10 @@ class SignalClassifier:
                     classified_at=datetime.now(tz=timezone.utc),
                     pre_filter_hit=rule,
                 )
+                self._observer.on_dropped(signal, rule)
             # If rule is None the signal was parked (stale) — pre_filter()
             # already attached an "uncertain" classification with
-            # pre_filter_hit="stale" above.
+            # pre_filter_hit="stale" above, and emitted on_parked itself.
             self._input.ack(signal.id)
             return
 
@@ -583,6 +595,7 @@ class SignalClassifier:
                 classified_at=datetime.now(tz=timezone.utc),
                 duplicate_of=canonical_id,
             )
+            self._observer.on_duplicate(signal, canonical_id)
             self._input.ack(signal.id)
             return
 
@@ -617,9 +630,15 @@ class SignalClassifier:
         if result == "relevant":
             self._output.enqueue(signal)
             self._metrics.increment(SIGNALS_CLASSIFIED_RELEVANT)
+            self._observer.on_work_item(
+                signal,
+                signal.classification.confidence if signal.classification else None,
+            )
         elif result == "irrelevant":
             self._dedup.mark_dropped(signal.id)
             self._metrics.increment(SIGNALS_CLASSIFIED_IRRELEVANT)
+            self._observer.on_dropped(signal, None)
         else:  # "uncertain"
             self._human.add(signal, reason="uncertain")
             self._metrics.increment(SIGNALS_CLASSIFIED_UNCERTAIN)
+            self._observer.on_review(signal, "uncertain")

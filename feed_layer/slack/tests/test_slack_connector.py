@@ -636,3 +636,155 @@ class TestMultiReactionRace:
 
         assert resp.status_code == 200
         assert queue.depth() == 0
+
+
+# ---------------------------------------------------------------------------
+# ControlStore integration (runtime channel filter)
+# ---------------------------------------------------------------------------
+
+class _FakeControlStore:
+    """Minimal stand-in for feed_layer.control_plane.ControlStore.
+
+    Mirrors the real fail-open semantics: with no channels registered every
+    channel is enabled; once at least one channel is registered, only
+    channels explicitly present *and* enabled pass.
+    """
+
+    def __init__(self, enabled: dict[str, bool] | None = None) -> None:
+        self._enabled = dict(enabled or {})
+
+    def slack_channel_enabled(self, channel_id: str) -> bool:
+        if not self._enabled:
+            return True
+        return self._enabled.get(channel_id, False)
+
+
+class TestControlStoreChannelGate:
+    def _reaction_body(self, channel: str, ts: str = "1700000001.000000") -> dict[str, Any]:
+        return {
+            "event": {
+                "type": "reaction_added",
+                "reaction": "aquarium",
+                "user": "U_REACTOR",
+                "user_name": "reactor",
+                "item": {"type": "message", "channel": channel, "ts": ts},
+            }
+        }
+
+    def _bot_message_body(self, channel: str, ts: str = "1700000005.000000") -> dict[str, Any]:
+        return {
+            "event": {
+                "type": "message",
+                "subtype": "bot_message",
+                "channel": channel,
+                "ts": ts,
+                "text": "bot says hello",
+                "bot_id": "B_BOT1",
+                "username": "mybot",
+            }
+        }
+
+    def test_reaction_in_disabled_channel_not_enqueued(self, queue):
+        control_store = _FakeControlStore(enabled={"C1": False})
+        app = create_app(
+            queue=queue,
+            slack_client_factory=_make_slack_client(),
+            config_overrides={"INTAKE_EMOJI": "aquarium"},
+            control_store=control_store,
+        )
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = _post(c, self._reaction_body("C1"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 0
+
+    def test_reaction_in_enabled_channel_is_enqueued(self, queue):
+        control_store = _FakeControlStore(enabled={"C1": True})
+        app = create_app(
+            queue=queue,
+            slack_client_factory=_make_slack_client(),
+            config_overrides={"INTAKE_EMOJI": "aquarium"},
+            control_store=control_store,
+        )
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = _post(c, self._reaction_body("C1"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 1
+
+    def test_reaction_in_unregistered_channel_not_enqueued(self, queue):
+        """A different channel is registered — fail-open only applies when the
+        store has no channels at all, so an unregistered channel is blocked."""
+        control_store = _FakeControlStore(enabled={"C_OTHER": True})
+        app = create_app(
+            queue=queue,
+            slack_client_factory=_make_slack_client(),
+            config_overrides={"INTAKE_EMOJI": "aquarium"},
+            control_store=control_store,
+        )
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = _post(c, self._reaction_body("C1"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 0
+
+    def test_no_control_store_reaction_enqueued_regression(self, queue):
+        """Regression guard: omitting control_store preserves prior behaviour."""
+        app = create_app(
+            queue=queue,
+            slack_client_factory=_make_slack_client(),
+            config_overrides={"INTAKE_EMOJI": "aquarium"},
+        )
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = _post(c, self._reaction_body("C1"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 1
+
+    def test_bot_message_gated_by_control_store_in_addition_to_monitored_channels(self, queue):
+        """bot_message path: MONITORED_CHANNELS AND control_store must both pass."""
+        control_store = _FakeControlStore(enabled={"C_MONITORED": False})
+        app = create_app(
+            queue=queue,
+            slack_client_factory=_make_slack_client(),
+            config_overrides={
+                "INTAKE_EMOJI": "aquarium",
+                "MONITORED_CHANNELS": ["C_MONITORED"],
+            },
+            control_store=control_store,
+        )
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = _post(c, self._bot_message_body("C_MONITORED"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 0
+
+    def test_bot_message_enqueued_when_both_gates_pass(self, queue):
+        control_store = _FakeControlStore(enabled={"C_MONITORED": True})
+        app = create_app(
+            queue=queue,
+            slack_client_factory=_make_slack_client(),
+            config_overrides={
+                "INTAKE_EMOJI": "aquarium",
+                "MONITORED_CHANNELS": ["C_MONITORED"],
+            },
+            control_store=control_store,
+        )
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            resp = _post(c, self._bot_message_body("C_MONITORED"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 1
+
+    def test_no_control_store_bot_message_enqueued_regression(self, queue, client):
+        """Regression guard: omitting control_store preserves prior bot_message behaviour."""
+        resp = _post(client, self._bot_message_body("C_MONITORED"))
+
+        assert resp.status_code == 200
+        assert queue.depth() == 1

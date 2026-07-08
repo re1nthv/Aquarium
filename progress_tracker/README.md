@@ -10,7 +10,7 @@ See [CHANGELOG.md](CHANGELOG.md) for a running log of every change.
 
 | Layer | Status | Sub-modules |
 |---|---|---|
-| [Feed Layer](feed_layer/README.md) | 🟢 Complete | 4 / 4 complete — 92 tests passing |
+| [Feed Layer](feed_layer/README.md) | 🟢 Complete | 4 / 4 sub-modules + control plane & dashboard — 195 tests passing |
 | [Task Management Layer](task_management_layer/README.md) | 🔴 Not Started | 0 / 7 complete |
 | [Task Executor Layer](task_executor_layer/README.md) | 🔴 Not Started | 0 / 4 complete |
 | [Judgement Layer](judgement_layer/README.md) | 🔴 Not Started | 0 / 3 complete |
@@ -35,10 +35,12 @@ See [CHANGELOG.md](CHANGELOG.md) for a running log of every change.
 
 | Sub-module | Status |
 |---|---|
-| slack | 🟢 Complete — 17 tests passing |
-| gus | 🟢 Complete — 23 tests passing |
-| google_workspace | 🟢 Complete — 25 tests passing |
-| signal_classifier | 🟢 Complete — 27 tests passing |
+| slack | 🟢 Complete — 31 tests passing |
+| gus | 🟢 Complete — 42 tests passing |
+| google_workspace | 🟢 Complete — 33 tests passing |
+| signal_classifier | 🟢 Complete — 44 tests passing |
+| control_plane | 🟢 Complete — 28 tests passing (config + observability) |
+| dashboard | 🟢 Complete — 17 tests passing (operator UX) |
 
 ---
 

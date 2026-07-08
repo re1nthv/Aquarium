@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from feed_layer.control_plane import JournalObserver, NullObserver, SignalJournal
 from feed_layer.shared import (
     Classification,
     GusMetadata,
@@ -912,3 +913,200 @@ class TestContentTruncationBeforeLLM:
 
         assert capturing_llm.seen_contents == [short_content]
         assert sig.raw_content == short_content
+
+
+# ---------------------------------------------------------------------------
+# SignalObserver integration — dashboard lifecycle hook
+# ---------------------------------------------------------------------------
+
+
+def make_observed_classifier(
+    observer,
+    llm_responses: Optional[list] = None,
+    batch_size: int = 10,
+    daily_token_budget: int = 100_000,
+    spam_bot_names: Optional[list[str]] = None,
+):
+    """Like make_classifier, but wires in a real (non-default) observer."""
+    input_q: InMemoryQueue = InMemoryQueue()
+    output_q: InMemoryQueue = InMemoryQueue()
+    human_q = InMemoryHumanReviewQueue()
+    metrics = InMemoryMetricsCollector()
+    config = ClassifierConfig(
+        batch_size=batch_size,
+        daily_token_budget=daily_token_budget,
+        spam_bot_names=spam_bot_names if spam_bot_names is not None else ["giphy", "polly"],
+    )
+    llm = InMemoryLLMClient(responses=llm_responses or [("relevant", 100, 0.9)])
+    embedder = InMemoryEmbedder()
+    dedup = InMemoryDedupStore()
+
+    classifier = SignalClassifier(
+        input_queue=input_q,
+        output_queue=output_q,
+        llm_client=llm,
+        embedder=embedder,
+        dedup_store=dedup,
+        human_queue=human_q,
+        metrics=metrics,
+        config=config,
+        observer=observer,
+    )
+    return classifier, input_q, output_q, human_q, metrics, config
+
+
+class TestSignalObserverIntegration:
+    """End-to-end assertions that the classifier drives a real SignalJournal
+    (via JournalObserver) correctly through every lifecycle outcome.
+    """
+
+    def test_default_observer_is_null_and_behaviour_unchanged(self):
+        """Regression: with no observer argument, the classifier still works
+        exactly as before (NullObserver default, no dashboard wiring).
+        """
+        classifier, input_q, output_q, human_q, metrics, _ = make_classifier(
+            llm_responses=[("relevant", 100, 0.9)]
+        )
+        assert isinstance(classifier._observer, NullObserver)
+
+        sig = make_signal()
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert output_q.depth() == 1
+        assert metrics.get_count(SIGNALS_CLASSIFIED_RELEVANT) == 1
+
+    def test_relevant_signal_recorded_as_work_item_in_journal(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, _ = make_observed_classifier(
+            observer, llm_responses=[("relevant", 100, 0.9)]
+        )
+
+        sig = make_signal(raw_content="A signal that will be classified relevant here")
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert output_q.depth() == 1
+        entry = journal.recent(limit=10, source="slack")[0]
+        assert entry.signal_id == sig.id
+        assert entry.outcome == "work_item"
+        assert entry.confidence == 0.9
+
+    def test_pre_filter_drop_recorded_as_dropped_with_rule(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, _ = make_observed_classifier(
+            observer
+        )
+
+        sig = make_signal(
+            source="slack",
+            signal_type="bot_message",
+            originator_name="giphy",
+        )
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert output_q.depth() == 0
+        entry = journal.recent(limit=10)[0]
+        assert entry.signal_id == sig.id
+        assert entry.outcome == "dropped"
+        assert entry.pre_filter_rule == "spam_bot"
+
+    def test_empty_content_drop_recorded_as_dropped_with_rule(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, _ = make_observed_classifier(
+            observer
+        )
+
+        sig = make_signal(raw_content="")
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        entry = journal.recent(limit=10)[0]
+        assert entry.outcome == "dropped"
+        assert entry.pre_filter_rule == "empty_content"
+
+    def test_duplicate_signal_recorded_as_duplicate_in_journal(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, _ = make_observed_classifier(
+            observer, llm_responses=[("relevant", 100, 0.9)]
+        )
+
+        content = "Duplicate-check content that is long enough for the dedup step"
+        sig1 = make_signal(raw_content=content)
+        sig2 = make_signal(raw_content=content)
+
+        input_q.enqueue(sig1)
+        classifier.process_batch()
+        input_q.enqueue(sig2)
+        classifier.process_batch()
+
+        entry = journal.recent(limit=10)[0]  # most-recent-first -> sig2
+        assert entry.signal_id == sig2.id
+        assert entry.outcome == "duplicate"
+        assert entry.duplicate_of == sig1.id
+
+    def test_uncertain_signal_recorded_as_review_in_journal(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, _ = make_observed_classifier(
+            observer, llm_responses=[("uncertain", 75, 0.4)]
+        )
+
+        sig = make_signal()
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert human_q.depth() == 1
+        entry = journal.recent(limit=10)[0]
+        assert entry.signal_id == sig.id
+        assert entry.outcome == "review"
+        assert entry.review_reason == "uncertain"
+
+    def test_llm_unavailable_recorded_as_parked_in_journal(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, _ = make_observed_classifier(
+            observer
+        )
+
+        class _AlwaysFailLLM(InMemoryLLMClient):
+            def classify(self, signal, prompt_version):
+                raise RuntimeError("persistent LLM failure")
+
+        classifier._llm = _AlwaysFailLLM()
+
+        with patch("time.sleep"):
+            sig = make_signal()
+            input_q.enqueue(sig)
+            classifier.process_batch()
+
+        assert human_q.depth() == 1
+        entry = journal.recent(limit=10)[0]
+        assert entry.signal_id == sig.id
+        assert entry.outcome == "parked"
+        assert entry.review_reason == "llm_unavailable"
+
+    def test_budget_exhausted_recorded_as_parked_in_journal(self):
+        journal = SignalJournal()
+        observer = JournalObserver(journal)
+        classifier, input_q, output_q, human_q, metrics, config = make_observed_classifier(
+            observer, daily_token_budget=0
+        )
+        config._tokens_used_today = config.daily_token_budget
+
+        sig = make_signal()
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert output_q.depth() == 0
+        assert human_q.depth() == 0
+        assert input_q.depth() == 1
+        entry = journal.recent(limit=10)[0]
+        assert entry.signal_id == sig.id
+        assert entry.outcome == "parked"
+        assert entry.review_reason == "budget_exhausted"

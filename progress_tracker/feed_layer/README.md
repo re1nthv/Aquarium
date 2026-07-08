@@ -4,12 +4,14 @@ Parent: [progress_tracker/](../README.md)
 
 | Sub-module | Status | Notes |
 |---|---|---|
-| slack | 🟢 Complete | Implemented + hardened — 24 tests passing |
-| gus | 🟢 Complete | Implemented + hardened — 37 tests passing |
+| slack | 🟢 Complete | Implemented + hardened + channel-sniff gate — 31 tests passing |
+| gus | 🟢 Complete | Implemented + hardened + team-follow gate — 42 tests passing |
 | google_workspace | 🟢 Complete | Implemented + hardened — 33 tests passing |
-| signal_classifier | 🟢 Complete | Implemented + hardened — 36 tests passing |
+| signal_classifier | 🟢 Complete | Implemented + hardened + observer hook — 44 tests passing |
+| control_plane | 🟢 Complete | ControlStore + SignalJournal + SignalObserver — 28 tests passing |
+| dashboard | 🟢 Complete | Operator UX console (Flask + HTML) — 17 tests passing |
 
-**Layer status: 🟢 Complete — 130/130 tests passing**
+**Layer status: 🟢 Complete — 195/195 tests passing**
 
 ---
 
@@ -78,4 +80,33 @@ Parent: [progress_tracker/](../README.md)
 - Date-aware, injectable token budget (`TokenBudgetStore` + `InMemoryTokenBudgetStore`) — resets at day boundaries, swappable for a durable backend
 - Explicit raw_content truncation before the LLM call (`max_llm_content_chars`); the stored signal is never mutated
 
+**Design updates (2026-07-08):**
+- Accepts an injectable `SignalObserver` (default `NullObserver`) and emits detected/dropped/duplicate/parked/review/work_item lifecycle events, decoupling the classifier from the dashboard.
+
 **Deferred (external responsibilities, by design):** 4-hour SLA escalation, 50-example feedback-loop trigger, moderator Slack DM, and real LLM/embedding/store backends (currently in-memory stubs behind ABCs).
+
+---
+
+### control_plane — 🟢 Complete
+**Shared runtime state for feed-layer configuration and observability.**
+
+**What is built:**
+- `ControlStore` — editable config: which Slack channels to sniff (`{id, name, enabled}` toggles) and which GUS teams to follow. Thread-safe, JSON-persisted with atomic write, and **fail-open** (empty config = allow everything), so wiring it into a connector never changes behaviour until an operator narrows scope.
+- `SignalJournal` — bounded, thread-safe record of every detected signal and its terminal outcome (`work_item` / `dropped` / `duplicate` / `review` / `parked`). Powers the dashboard's feed, work-item list, and rollup counts.
+- `SignalObserver` / `NullObserver` / `JournalObserver` — the classifier hook that populates the journal.
+
+**Role:** the contract the connectors, classifier, and dashboard all depend on.
+
+---
+
+### dashboard — 🟢 Complete
+**Operator UX console for the feed layer.**
+
+**What is built:**
+- `create_dashboard_app(control_store, journal)` — Flask app, single self-contained HTML page (inline CSS + vanilla JS, no build step; matches the repo's Flask+stdlib stack).
+- Per-module status cards (Slack / GUS / Google Workspace): enabled state, detected count, work-item count, last-detected time, scope.
+- Live **Detected Signals** feed with source and outcome filters, and a **Work Items** list — both polled every ~4s.
+- Config panels: toggle Slack channels on/off, add/remove; add/remove followed GUS teams. Edits write straight to the shared `ControlStore`, changing what the connectors ingest.
+- JSON API: `/api/status`, `/api/signals`, `/api/work-items`, `/api/config/slack/channels`, `/api/config/gus/teams`.
+
+**Scope:** feed layer only for now, as requested. **Deferred:** dashboard auth, websocket push (polling for now), editing the GWS intake folder from the UI, and dashboards for the other three layers.

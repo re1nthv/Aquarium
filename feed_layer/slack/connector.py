@@ -114,6 +114,7 @@ def create_app(
     queue: MessageQueue,
     slack_client_factory: Optional[Callable[[str], Any]] = None,
     config_overrides: Optional[dict[str, Any]] = None,
+    control_store: Optional[Any] = None,
 ) -> Flask:
     """Create and return the configured Flask application.
 
@@ -129,6 +130,12 @@ def create_app(
     config_overrides:
         Optional dict of config values to override module-level defaults.
         Recognised keys: INTAKE_EMOJI, MONITORED_CHANNELS, SLACK_SIGNING_SECRET.
+    control_store:
+        Optional ``feed_layer.control_plane.ControlStore``. When provided,
+        both signal paths (reaction_added, bot_message) are additionally
+        gated by ``control_store.slack_channel_enabled(channel_id)``. When
+        omitted (default), behaviour is unchanged from before this gate
+        existed — fully backward-compatible.
     """
     # -- resolve effective config ----------------------------------------
     cfg: dict[str, Any] = {
@@ -178,13 +185,15 @@ def create_app(
 
         try:
             if event_type == "reaction_added":
-                return _handle_reaction_added(event, queue, cfg, slack_client_factory)
+                return _handle_reaction_added(
+                    event, queue, cfg, slack_client_factory, control_store
+                )
 
             if event_type == "reaction_removed":
                 return _handle_reaction_removed(event, queue, cfg)
 
             if event_type == "message":
-                return _handle_message(event, queue, cfg)
+                return _handle_message(event, queue, cfg, control_store)
 
         except Exception:  # pylint: disable=broad-except
             logger.exception("Unhandled exception processing Slack event")
@@ -206,6 +215,7 @@ def _handle_reaction_added(
     queue: MessageQueue,
     cfg: dict[str, Any],
     slack_client_factory: Callable[[str], Any],
+    control_store: Optional[Any] = None,
 ) -> tuple[Response, int]:
     """Process a reaction_added event."""
     reaction_name: str = event.get("reaction", "")
@@ -217,6 +227,9 @@ def _handle_reaction_added(
     message_ts: str = item.get("ts", "")
     reactor_id: str = event.get("user", "")
     reactor_name: str = event.get("user_name", reactor_id)
+
+    if control_store is not None and not control_store.slack_channel_enabled(channel_id):
+        return jsonify({"ok": True}), 200
 
     # Fetch the original message so we can get its text and thread_ts.
     raw_content, thread_ts = _fetch_message_content(
@@ -286,6 +299,7 @@ def _handle_message(
     event: dict[str, Any],
     queue: MessageQueue,
     cfg: dict[str, Any],
+    control_store: Optional[Any] = None,
 ) -> tuple[Response, int]:
     """Process a message event from a bot."""
     subtype: str = event.get("subtype", "")
@@ -297,6 +311,9 @@ def _handle_message(
 
     channel_id: str = event.get("channel", "")
     if channel_id not in cfg["MONITORED_CHANNELS"]:
+        return jsonify({"ok": True}), 200
+
+    if control_store is not None and not control_store.slack_channel_enabled(channel_id):
         return jsonify({"ok": True}), 200
 
     message_ts: str = event.get("ts", "")

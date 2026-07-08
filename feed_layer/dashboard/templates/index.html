@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Aquarium — Feed Layer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-alt: #1c2438;
+    --border: #2a3350;
+    --text: #e6e9f2;
+    --muted: #8b93a8;
+    --accent: #4d8dff;
+    --green: #2fbf71;
+    --grey: #6b7280;
+    --amber: #d9a12b;
+    --blue: #3b82c4;
+    --orange: #d97b2b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .card .card-title { font-weight: 600; font-size: 14px; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  .pill.on { background: rgba(47,191,113,0.15); color: var(--green); }
+  .pill.off { background: rgba(107,114,128,0.2); color: var(--grey); }
+  .card .metric-row { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .card .metric-row b { color: var(--text); font-weight: 600; }
+
+  .columns { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 10px 0; }
+  .filters { display: flex; gap: 8px; margin-bottom: 10px; }
+  select, input[type=text] {
+    background: var(--panel-alt);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+  }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.secondary { background: var(--panel-alt); border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: #7f2b2b; }
+
+  .feed-list { display: flex; flex-direction: column; gap: 8px; max-height: 480px; overflow-y: auto; }
+  .feed-item {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .feed-item .row1 { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .badge { font-size: 10px; padding: 2px 7px; border-radius: 999px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+  .badge.source { background: rgba(77,141,255,0.18); color: var(--accent); }
+  .badge.outcome-work_item { background: rgba(47,191,113,0.18); color: var(--green); }
+  .badge.outcome-dropped { background: rgba(107,114,128,0.22); color: var(--grey); }
+  .badge.outcome-duplicate { background: rgba(217,161,43,0.18); color: var(--amber); }
+  .badge.outcome-review { background: rgba(59,130,196,0.18); color: var(--blue); }
+  .badge.outcome-parked { background: rgba(217,123,43,0.18); color: var(--orange); }
+  .badge.outcome-detected { background: rgba(139,147,168,0.18); color: var(--muted); }
+  .feed-item .time { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .feed-item .originator { color: var(--muted); }
+  .feed-item .snippet { color: var(--text); opacity: 0.9; overflow-wrap: anywhere; }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+
+  .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .config-grid { grid-template-columns: 1fr; } }
+  .config-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; max-height: 220px; overflow-y: auto; }
+  .config-row { display: flex; align-items: center; gap: 8px; background: var(--panel-alt); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  .config-row .name { flex: 1; overflow-wrap: anywhere; }
+  .add-row { display: flex; gap: 8px; }
+  .toggle { cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aquarium — Feed Layer</h1>
+  <span class="sub">operator console</span>
+</header>
+
+<main>
+  <section class="cards" id="status-cards"></section>
+
+  <section class="columns">
+    <div class="panel">
+      <h2>Detected Signals</h2>
+      <div class="filters">
+        <select id="filter-source">
+          <option value="">All sources</option>
+          <option value="slack">Slack</option>
+          <option value="gus">GUS</option>
+          <option value="google_workspace">Google Workspace</option>
+        </select>
+        <select id="filter-outcome">
+          <option value="">All outcomes</option>
+          <option value="detected">detected</option>
+          <option value="work_item">work_item</option>
+          <option value="dropped">dropped</option>
+          <option value="duplicate">duplicate</option>
+          <option value="review">review</option>
+          <option value="parked">parked</option>
+        </select>
+      </div>
+      <div class="feed-list" id="signal-feed"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Work Items</h2>
+      <div class="feed-list" id="work-item-feed"></div>
+    </div>
+  </section>
+
+  <section class="config-grid">
+    <div class="panel">
+      <h2>Slack Channels</h2>
+      <div class="config-list" id="slack-channel-list"></div>
+      <div class="add-row">
+        <input type="text" id="slack-channel-id" placeholder="channel id (e.g. C0123)">
+        <input type="text" id="slack-channel-name" placeholder="name (optional)">
+        <button id="slack-channel-add">Add</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>GUS Teams</h2>
+      <div class="config-list" id="gus-team-list"></div>
+      <div class="add-row">
+        <input type="text" id="gus-team-name" placeholder="team name">
+        <button id="gus-team-add">Add</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const POLL_MS = 4000;
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function fmtTime(iso) {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString();
+  } catch (e) {
+    return iso;
+  }
+}
+
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  return res.json();
+}
+
+async function sendJSON(url, method, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = `${method} ${url} -> ${res.status}`;
+    try {
+      const data = await res.json();
+      if (data && data.error) msg += `: ${data.error}`;
+    } catch (e) { /* ignore */ }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+// ---- status cards ----------------------------------------------------
+
+function renderStatus(data) {
+  const el = document.getElementById("status-cards");
+  el.innerHTML = (data.modules || []).map(m => `
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">${esc(m.label)}</span>
+        <span class="pill ${m.enabled ? "on" : "off"}">${m.enabled ? "ENABLED" : "DISABLED"}</span>
+      </div>
+      <div class="metric-row"><span>Detected</span><b>${esc(m.detected)}</b></div>
+      <div class="metric-row"><span>Work items</span><b>${esc(m.work_items)}</b></div>
+      <div class="metric-row"><span>Last detected</span><b>${esc(fmtTime(m.last_detected))}</b></div>
+      <div class="metric-row"><span>Scope</span><b>${esc(m.scope)}</b></div>
+    </div>
+  `).join("");
+}
+
+async function refreshStatus() {
+  try {
+    renderStatus(await getJSON("/api/status"));
+  } catch (e) { console.error(e); }
+}
+
+// ---- signal / work-item feeds -----------------------------------------
+
+function outcomeBadge(outcome) {
+  return `<span class="badge outcome-${esc(outcome)}">${esc(outcome)}</span>`;
+}
+
+function renderFeed(containerId, entries) {
+  const el = document.getElementById(containerId);
+  if (!entries || entries.length === 0) {
+    el.innerHTML = `<div class="empty">No signals yet.</div>`;
+    return;
+  }
+  el.innerHTML = entries.map(e => `
+    <div class="feed-item">
+      <div class="row1">
+        <span class="badge source">${esc(e.source)}</span>
+        <span>${esc(e.type)}</span>
+        ${outcomeBadge(e.outcome)}
+        <span class="time">${esc(fmtTime(e.outcome_at || e.detected_at))}</span>
+      </div>
+      <div class="originator">${esc(e.originator_name || "unknown")}</div>
+      <div class="snippet">${esc(e.snippet)}</div>
+    </div>
+  `).join("");
+}
+
+async function refreshSignals() {
+  const source = document.getElementById("filter-source").value;
+  const outcome = document.getElementById("filter-outcome").value;
+  const params = new URLSearchParams();
+  if (source) params.set("source", source);
+  if (outcome) params.set("outcome", outcome);
+  params.set("limit", "100");
+  try {
+    const data = await getJSON(`/api/signals?${params.toString()}`);
+    renderFeed("signal-feed", data.signals);
+  } catch (e) { console.error(e); }
+}
+
+async function refreshWorkItems() {
+  try {
+    const data = await getJSON("/api/work-items?limit=100");
+    renderFeed("work-item-feed", data.work_items);
+  } catch (e) { console.error(e); }
+}
+
+// ---- Slack channel config ----------------------------------------------
+
+async function refreshSlackChannels() {
+  const el = document.getElementById("slack-channel-list");
+  try {
+    const data = await getJSON("/api/config/slack/channels");
+    const channels = data.channels || [];
+    if (channels.length === 0) {
+      el.innerHTML = `<div class="empty">No channels registered — all channels are sniffed.</div>`;
+      return;
+    }
+    el.innerHTML = channels.map(c => `
+      <div class="config-row">
+        <input type="checkbox" class="toggle" data-id="${esc(c.id)}" ${c.enabled ? "checked" : ""}>
+        <span class="name">${esc(c.name || c.id)} <span style="color:var(--muted)">(${esc(c.id)})</span></span>
+        <button class="danger" data-remove="${esc(c.id)}">Remove</button>
+      </div>
+    `).join("");
+    el.querySelectorAll(".toggle").forEach(cb => {
+      cb.addEventListener("change", async () => {
+        try {
+          await sendJSON(`/api/config/slack/channels/${encodeURIComponent(cb.dataset.id)}`, "PUT", { enabled: cb.checked });
+        } catch (e) { console.error(e); }
+        refreshSlackChannels();
+        refreshStatus();
+      });
+    });
+    el.querySelectorAll("[data-remove]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          await sendJSON(`/api/config/slack/channels/${encodeURIComponent(btn.dataset.remove)}`, "DELETE");
+        } catch (e) { console.error(e); }
+        refreshSlackChannels();
+        refreshStatus();
+      });
+    });
+  } catch (e) { console.error(e); }
+}
+
+document.getElementById("slack-channel-add").addEventListener("click", async () => {
+  const idEl = document.getElementById("slack-channel-id");
+  const nameEl = document.getElementById("slack-channel-name");
+  const id = idEl.value.trim();
+  if (!id) return;
+  try {
+    await sendJSON("/api/config/slack/channels", "POST", { id, name: nameEl.value.trim() });
+    idEl.value = "";
+    nameEl.value = "";
+    refreshSlackChannels();
+    refreshStatus();
+  } catch (e) { console.error(e); }
+});
+
+// ---- GUS team config -----------------------------------------------------
+
+async function refreshGusTeams() {
+  const el = document.getElementById("gus-team-list");
+  try {
+    const data = await getJSON("/api/config/gus/teams");
+    const teams = data.teams || [];
+    if (teams.length === 0) {
+      el.innerHTML = `<div class="empty">No teams followed — all teams are ingested.</div>`;
+      return;
+    }
+    el.innerHTML = teams.map(t => `
+      <div class="config-row">
+        <span class="name">${esc(t)}</span>
+        <button class="danger" data-remove="${esc(t)}">Remove</button>
+      </div>
+    `).join("");
+    el.querySelectorAll("[data-remove]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          await sendJSON(`/api/config/gus/teams/${encodeURIComponent(btn.dataset.remove)}`, "DELETE");
+        } catch (e) { console.error(e); }
+        refreshGusTeams();
+        refreshStatus();
+      });
+    });
+  } catch (e) { console.error(e); }
+}
+
+document.getElementById("gus-team-add").addEventListener("click", async () => {
+  const nameEl = document.getElementById("gus-team-name");
+  const team = nameEl.value.trim();
+  if (!team) return;
+  try {
+    await sendJSON("/api/config/gus/teams", "POST", { team });
+    nameEl.value = "";
+    refreshGusTeams();
+    refreshStatus();
+  } catch (e) { console.error(e); }
+});
+
+// ---- filters trigger immediate refresh -----------------------------------
+
+document.getElementById("filter-source").addEventListener("change", refreshSignals);
+document.getElementById("filter-outcome").addEventListener("change", refreshSignals);
+
+// ---- boot -----------------------------------------------------------------
+
+function refreshAll() {
+  refreshStatus();
+  refreshSignals();
+  refreshWorkItems();
+}
+
+refreshAll();
+refreshSlackChannels();
+refreshGusTeams();
+setInterval(refreshAll, POLL_MS);
+</script>
+</body>
+</html>

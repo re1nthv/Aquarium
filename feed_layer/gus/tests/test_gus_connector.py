@@ -735,3 +735,113 @@ class TestSchemaCorrectness:
         signals = queue_from_app.dequeue()
         sig = signals[0]
         assert sig.raw_content == "My Epic Title — My epic description"
+
+
+# ---------------------------------------------------------------------------
+# ControlStore integration (runtime team filter)
+# ---------------------------------------------------------------------------
+
+class _FakeControlStore:
+    """Minimal stand-in for feed_layer.control_plane.ControlStore.
+
+    Mirrors the real fail-open semantics: with no teams registered every
+    team is followed; once at least one team is registered, only registered
+    teams (case-insensitive) pass, and a missing/None team is never followed.
+    """
+
+    def __init__(self, followed: Optional[list[str]] = None) -> None:
+        self._followed = {t.strip().lower() for t in (followed or [])}
+
+    def gus_team_followed(self, team: Optional[str]) -> bool:
+        if not self._followed:
+            return True
+        if not team:
+            return False
+        return team.strip().lower() in self._followed
+
+
+class TestControlStoreTeamGateWebhook:
+    def test_webhook_followed_team_enqueued(self):
+        control_store = _FakeControlStore(followed=["Team Alpha"])
+        q = InMemoryQueue()
+        app = create_app(q, control_store=control_store)
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            payload = _make_payload("epic.created", gus_item_id="W-FOLLOWED", team="Team Alpha")
+            status, _ = _post(c, "epic.created", payload)
+
+        assert status == 200
+        signals = q.dequeue()
+        assert len(signals) == 1
+        assert signals[0].metadata.gus_item_id == "W-FOLLOWED"
+
+    def test_webhook_unfollowed_team_not_enqueued(self):
+        control_store = _FakeControlStore(followed=["Team Alpha"])
+        q = InMemoryQueue()
+        app = create_app(q, control_store=control_store)
+        app.config["TESTING"] = True
+        with app.test_client() as c:
+            payload = _make_payload("epic.created", gus_item_id="W-UNFOLLOWED", team="Team Zulu")
+            status, _ = _post(c, "epic.created", payload)
+
+        assert status == 200
+        assert q.depth() == 0
+
+    def test_webhook_no_control_store_regression(self, client, queue_from_app):
+        """Regression guard: omitting control_store preserves prior webhook behaviour."""
+        payload = _make_payload("epic.created", gus_item_id="W-NOCTRL", team="Any Team")
+        status, _ = _post(client, "epic.created", payload)
+
+        assert status == 200
+        signals = queue_from_app.dequeue()
+        assert len(signals) == 1
+        assert signals[0].metadata.gus_item_id == "W-NOCTRL"
+
+
+class TestControlStoreTeamGatePolling:
+    def test_poll_once_only_followed_team_enqueued_cursor_advances_past_both(self):
+        control_store = _FakeControlStore(followed=["Team Beta"])
+        items = [
+            _make_item(
+                "W-FOLLOWED",
+                item_type="epic",
+                team="Team Beta",
+                updated_at="2025-07-06T10:00:00+00:00",
+            ),
+            _make_item(
+                "W-UNFOLLOWED",
+                item_type="epic",
+                team="Team Gamma",
+                updated_at="2025-07-06T12:00:00+00:00",
+            ),
+        ]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor, control_store=control_store)
+
+        count = poller.poll_once()
+
+        assert count == 1
+        signals = q.dequeue()
+        assert len(signals) == 1
+        assert signals[0].metadata.gus_item_id == "W-FOLLOWED"
+
+        expected_ts = datetime(2025, 7, 6, 12, 0, 0, tzinfo=timezone.utc)
+        assert cursor.get() == expected_ts
+
+    def test_poll_once_no_control_store_regression(self):
+        """Regression guard: omitting control_store preserves prior polling behaviour."""
+        items = [
+            _make_item("W-P010", item_type="epic", team="Team Alpha"),
+            _make_item("W-P011", item_type="epic", team="Team Zulu"),
+        ]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor)
+
+        count = poller.poll_once()
+
+        assert count == 2
+        assert q.depth() == 2

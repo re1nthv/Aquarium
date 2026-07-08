@@ -15,7 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from flask import Flask, request, jsonify
 
@@ -303,7 +303,7 @@ def _queue_replace(queue: MessageQueue, old_id: str, new_signal: Signal) -> bool
 # Flask app factory
 # ---------------------------------------------------------------------------
 
-def create_app(queue: MessageQueue) -> Flask:
+def create_app(queue: MessageQueue, control_store: Optional[Any] = None) -> Flask:
     """
     Create and return the Flask application for the GUS webhook handler.
 
@@ -311,6 +311,12 @@ def create_app(queue: MessageQueue) -> Flask:
     ----------
     queue:
         The shared MessageQueue all enqueued signals are written to.
+    control_store:
+        Optional ``feed_layer.control_plane.ControlStore``. When provided,
+        signals are additionally gated by
+        ``control_store.gus_team_followed(signal.metadata.team)`` — an
+        unfollowed team's signal is not enqueued (still returns 200). When
+        omitted (default), behaviour is unchanged.
     """
     app = Flask(__name__)
     tracker = _RapidUpdateTracker(queue)
@@ -353,6 +359,11 @@ def create_app(queue: MessageQueue) -> Flask:
             signal = _build_signal_from_payload(event_type, signal_type, payload)
         except (KeyError, TypeError, ValueError):
             # Malformed payload — still return 200 per spec (enqueue is best-effort)
+            return jsonify({"status": "ignored"}), 200
+
+        if control_store is not None and not control_store.gus_team_followed(
+            signal.metadata.team  # type: ignore[union-attr]
+        ):
             return jsonify({"status": "ignored"}), 200
 
         try:
@@ -431,11 +442,13 @@ class GusPoller:
         queue: MessageQueue,
         cursor_store: CursorStore,
         rate_limiter: Optional[RateLimiter] = None,
+        control_store: Optional[Any] = None,
     ) -> None:
         self._client = gus_client
         self._queue = queue
         self._cursor_store = cursor_store
         self._rate_limiter = rate_limiter or RateLimiter(MAX_REQUESTS_PER_SECOND)
+        self._control_store = control_store
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
@@ -459,6 +472,10 @@ class GusPoller:
         count = 0
         for item in items:
             signal = _build_signal_from_polled_item(item)
+            if signal is not None and self._control_store is not None:
+                team = signal.metadata.team  # type: ignore[union-attr]
+                if not self._control_store.gus_team_followed(team):
+                    signal = None
             if signal is not None:
                 self._queue.enqueue(signal)
                 count += 1
