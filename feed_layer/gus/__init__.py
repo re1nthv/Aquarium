@@ -8,6 +8,8 @@ from .connector import (
     GusClient,
     CursorStore,
     InMemoryCursorStore,
+    FileCursorStore,
+    RateLimiter,
     GusPoller,
     create_app,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "GusClient",
     "CursorStore",
     "InMemoryCursorStore",
+    "FileCursorStore",
+    "RateLimiter",
     "GusPoller",
     "create_app",
     "POLLING_INTERVAL_SECONDS",

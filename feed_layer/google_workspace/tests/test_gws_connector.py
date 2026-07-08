@@ -24,6 +24,7 @@ from feed_layer.google_workspace.connector import (
     InMemoryCursorStore,
     WatchChannelRenewer,
     _dedup_enqueue,
+    _unpack_changes_result,
     create_app,
 )
 from feed_layer.google_workspace.config import READY_SUFFIX
@@ -512,3 +513,153 @@ def test_ingested_at_is_ingest_time_not_modified_time(client, queue):
     assert delta < 10, f"ingested_at {signal.ingested_at} is too far from now"
     # timestamp IS the document's modifiedTime.
     assert signal.timestamp == doc_modified
+
+
+# ===========================================================================
+# BUG 1 — page_token advancement across clustered notifications
+# ===========================================================================
+
+
+def test_page_token_advances_after_notification(queue):
+    """After a single notification, state["page_token"] must be updated to
+    the new_page_token returned by list_changes — not left at the token that
+    was just consumed."""
+    drive = MagicMock(spec=DriveClient)
+    drive.list_changes.return_value = {
+        "changes": [dict(_BASE_CHANGE)],
+        "new_page_token": "tok-2",
+    }
+    drive.get_file_metadata.return_value = dict(_BASE_FILE_META)
+    drive.get_file_content.return_value = "content"
+
+    app = create_app(drive, queue, page_token="tok-1", intake_folder_id=INTAKE_FOLDER)
+    with app.test_client() as c:
+        _post_notify(c)
+
+    drive.list_changes.assert_called_once_with("tok-1")
+    assert queue.depth() == 1
+
+
+def test_two_sequential_notifications_advance_page_token_no_dup(queue):
+    """Two clustered notifications must each query a *different* page token
+    (the one returned by the previous call), and must not reprocess the same
+    underlying change twice."""
+    drive = MagicMock(spec=DriveClient)
+
+    change_1 = dict(_BASE_CHANGE)
+    change_1["fileId"] = "file-page1"
+    meta_1 = dict(_BASE_FILE_META)
+    meta_1["id"] = "file-page1"
+    change_1["file"] = meta_1
+
+    change_2 = dict(_BASE_CHANGE)
+    change_2["fileId"] = "file-page2"
+    meta_2 = dict(_BASE_FILE_META)
+    meta_2["id"] = "file-page2"
+    change_2["file"] = meta_2
+
+    # First call (token "tok-1") returns change_1 and advances to "tok-2".
+    # Second call (token "tok-2") returns change_2 and advances to "tok-3".
+    # If the bug were present, the handler would call list_changes("tok-1")
+    # again on the second notification, re-returning change_1.
+    drive.list_changes.side_effect = [
+        {"changes": [change_1], "new_page_token": "tok-2"},
+        {"changes": [change_2], "new_page_token": "tok-3"},
+    ]
+    drive.get_file_metadata.side_effect = lambda fid: meta_1 if fid == "file-page1" else meta_2
+    drive.get_file_content.return_value = "content"
+
+    app = create_app(drive, queue, page_token="tok-1", intake_folder_id=INTAKE_FOLDER)
+    with app.test_client() as c:
+        _post_notify(c)  # consumes tok-1 -> tok-2
+        _post_notify(c)  # consumes tok-2 -> tok-3
+
+    # list_changes must have been called with the advancing tokens, not the
+    # same starting token twice.
+    called_tokens = [call.args[0] for call in drive.list_changes.call_args_list]
+    assert called_tokens == ["tok-1", "tok-2"]
+
+    # Two distinct files, two distinct signals — no duplicate processing.
+    assert queue.depth() == 2
+    signals = queue.dequeue()
+    file_ids = {s.metadata.file_id for s in signals}
+    assert file_ids == {"file-page1", "file-page2"}
+
+
+def test_unpack_changes_result_dict_shape():
+    changes, token = _unpack_changes_result(
+        {"changes": [{"a": 1}], "new_page_token": "next"}, "prev"
+    )
+    assert changes == [{"a": 1}]
+    assert token == "next"
+
+
+def test_unpack_changes_result_tuple_shape():
+    changes, token = _unpack_changes_result(([{"a": 1}], "next"), "prev")
+    assert changes == [{"a": 1}]
+    assert token == "next"
+
+
+def test_unpack_changes_result_legacy_list_shape():
+    """Legacy DriveClient implementations that return a bare list keep
+    working — the page token simply doesn't advance (falls back to the
+    token that was requested)."""
+    changes, token = _unpack_changes_result([{"a": 1}], "prev")
+    assert changes == [{"a": 1}]
+    assert token == "prev"
+
+
+# ===========================================================================
+# BUG 2 — watch-channel renewal failure must not crash and must be retried
+# ===========================================================================
+
+
+def test_renew_success_updates_expiry_and_returns_true():
+    drive = MagicMock(spec=DriveClient)
+    renewer = WatchChannelRenewer(drive, channel_id="chan-1", expiry_days=6)
+    renewer._channel_expiry = datetime.now(tz=timezone.utc) + timedelta(minutes=30)
+    old_expiry = renewer.get_channel_expiry()
+
+    result = renewer.renew_if_needed()
+
+    assert result is True
+    drive.renew_watch_channel.assert_called_once()
+    assert renewer.get_channel_expiry() > old_expiry
+
+
+def test_renew_failure_is_caught_and_expiry_not_advanced(caplog):
+    import logging
+
+    drive = MagicMock(spec=DriveClient)
+    drive.renew_watch_channel.side_effect = RuntimeError("Drive API 500")
+    renewer = WatchChannelRenewer(drive, channel_id="chan-1", expiry_days=6)
+    soon = datetime.now(tz=timezone.utc) + timedelta(minutes=30)
+    renewer._channel_expiry = soon
+
+    with caplog.at_level(logging.WARNING):
+        result = renewer.renew_if_needed()  # must not raise
+
+    assert result is False
+    assert renewer.get_channel_expiry() == soon, "expiry must not advance on failure"
+    assert "chan-1" in caplog.text
+    # PII discipline: no document content/body should ever be logged here.
+    assert "content" not in caplog.text.lower()
+
+
+def test_renew_failure_then_retry_attempts_again():
+    """After a failed renewal, the next renew_if_needed() call must attempt
+    renewal again (because expiry was left unchanged and is still within the
+    early-renewal window) rather than treating the failure as success."""
+    drive = MagicMock(spec=DriveClient)
+    drive.renew_watch_channel.side_effect = [RuntimeError("transient failure"), None]
+    renewer = WatchChannelRenewer(drive, channel_id="chan-1", expiry_days=6)
+    renewer._channel_expiry = datetime.now(tz=timezone.utc) + timedelta(minutes=30)
+
+    first_result = renewer.renew_if_needed()
+    assert first_result is False
+    assert drive.renew_watch_channel.call_count == 1
+
+    # Still within the renewal window (expiry untouched) -> retried.
+    second_result = renewer.renew_if_needed()
+    assert second_result is True
+    assert drive.renew_watch_channel.call_count == 2

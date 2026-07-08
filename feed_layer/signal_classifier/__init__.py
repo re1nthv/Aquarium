@@ -10,9 +10,11 @@ from .classifier import (
     InMemoryHumanReviewQueue,
     InMemoryLLMClient,
     InMemoryMetricsCollector,
+    InMemoryTokenBudgetStore,
     LLMClient,
     MetricsCollector,
     SignalClassifier,
+    TokenBudgetStore,
 )
 from .metrics_names import (
     LLM_FALLBACK_COUNT,
@@ -37,12 +39,14 @@ __all__ = [
     "DedupStore",
     "HumanReviewQueue",
     "MetricsCollector",
+    "TokenBudgetStore",
     # In-memory implementations
     "InMemoryLLMClient",
     "InMemoryEmbedder",
     "InMemoryDedupStore",
     "InMemoryHumanReviewQueue",
     "InMemoryMetricsCollector",
+    "InMemoryTokenBudgetStore",
     # Metric name constants
     "SIGNALS_INGESTED",
     "SIGNALS_PRE_FILTER_DROPPED",
