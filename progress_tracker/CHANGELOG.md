@@ -8,6 +8,11 @@ Format: `[YYYY-MM-DD] [layer/sub-module] [type: design | impl | fix | refactor |
 
 ## Log
 
+- [2026-07-08] [feed_layer/signal_classifier] [fix] — Hardening: populate `pre_filter_hit` on dropped/parked signals for audit; date-aware injectable token budget (`TokenBudgetStore` + `InMemoryTokenBudgetStore`, resets at day boundary, durable-backend swappable); explicit raw_content truncation before the LLM call (`max_llm_content_chars`, original signal unmutated). 36/36 tests passing (+9).
+- [2026-07-08] [feed_layer/google_workspace] [fix] — Hardening: advance Drive `page_token` after each `list_changes` (backward-compatible dict/tuple/legacy-list return shapes) to stop duplicate processing on clustered notifications; catch watch-channel renewal failures (log, don't advance expiry, retry next cycle) instead of propagating. 33/33 tests passing (+8).
+- [2026-07-08] [feed_layer/gus] [fix] — Hardening: polling now gates task items on `status == "Blocked"` and skips unknown item types (was mis-typing everything to task.blocked/epic.updated); added `RateLimiter` (min-interval, injectable clock/sleep) wired into GusPoller per `MAX_REQUESTS_PER_SECOND`; added durable `FileCursorStore` (atomic JSON write, epoch fallback on missing/malformed). 37/37 tests passing (+14).
+- [2026-07-08] [feed_layer/slack] [fix] — Hardening: implemented Slack request signature verification (HMAC-SHA256 over `v0:{ts}:{body}`, 5-min replay window, 401 on failure, skipped when no signing secret configured); fixed multi-reaction race by matching removal on (message_ts, reactor_id) via new optional `SlackMetadata.reactor_id`. 24/24 tests passing (+7).
+
 - [2026-07-06] [feed_layer/slack] [impl] — Implemented connector.py (Flask, reaction_added/removed toggle + bot_message via is_bot flag, async enqueue, 503 on queue failure). 17/17 tests passing.
 - [2026-07-06] [feed_layer/gus] [impl] — Implemented connector.py (webhook handler + GusPoller with durable cursor, rapid-update collapse, crash-safe watermark). 23/23 tests passing.
 - [2026-07-06] [feed_layer/google_workspace] [impl] — Implemented connector.py (Drive watch + polling fallback, [READY] gate, 5-min dedup, WatchChannelRenewer, 403 handling). 25/25 tests passing.

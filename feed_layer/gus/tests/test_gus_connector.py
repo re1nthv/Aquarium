@@ -21,12 +21,14 @@ from feed_layer.gus.connector import (
     GusClient,
     CursorStore,
     InMemoryCursorStore,
+    FileCursorStore,
+    RateLimiter,
     GusPoller,
     create_app,
     _RapidUpdateTracker,
     _now_utc,
 )
-from feed_layer.gus.config import RAPID_UPDATE_WINDOW_SECONDS
+from feed_layer.gus.config import MAX_REQUESTS_PER_SECOND, RAPID_UPDATE_WINDOW_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +316,9 @@ def _make_item(
     user_name: str = "Poller Bot",
     team: str = "Team Beta",
     gus_item_url: str = "https://gus.example.com/W-P001",
+    status: Optional[str] = None,
 ) -> dict:
-    return {
+    item = {
         "gus_item_id": gus_item_id,
         "title": title,
         "description": description,
@@ -326,6 +329,9 @@ def _make_item(
         "team": team,
         "gus_item_url": gus_item_url,
     }
+    if status is not None:
+        item["status"] = status
+    return item
 
 
 class TestPolling:
@@ -421,6 +427,266 @@ class TestPolling:
 
         assert len(client.calls) == 1
         assert client.calls[0] == stored_cursor
+
+
+# ---------------------------------------------------------------------------
+# BUG 1 — Polling must not ingest all task items unconditionally.
+# Only tasks with status == "Blocked" should produce task.blocked signals;
+# other task items and unknown item_types must be skipped without stalling
+# the cursor or crashing.
+# ---------------------------------------------------------------------------
+
+class TestPollingTaskStatusGate:
+
+    def test_polled_task_blocked_enqueues_task_blocked_signal(self):
+        """Polled task with status='Blocked' -> exactly one task.blocked signal."""
+        items = [_make_item("W-T001", item_type="task", status="Blocked")]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor)
+
+        count = poller.poll_once()
+
+        assert count == 1
+        signals = q.dequeue()
+        assert len(signals) == 1
+        assert signals[0].type == "task.blocked"
+        assert signals[0].metadata.gus_item_id == "W-T001"
+
+    def test_polled_task_open_is_skipped_nothing_enqueued(self):
+        """Polled task with status='Open' -> skipped, nothing enqueued."""
+        items = [_make_item("W-T002", item_type="task", status="Open")]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor)
+
+        count = poller.poll_once()
+
+        assert count == 0
+        assert q.depth() == 0
+
+    def test_polled_task_missing_status_is_skipped(self):
+        """Polled task with no status field at all -> skipped, not treated as Blocked."""
+        items = [_make_item("W-T003", item_type="task")]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor)
+
+        count = poller.poll_once()
+
+        assert count == 0
+        assert q.depth() == 0
+
+    def test_polled_unknown_item_type_is_skipped(self):
+        """Polled item with an unrecognised item_type -> skipped, not mis-typed as epic.updated."""
+        items = [_make_item("W-T004", item_type="widget")]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor)
+
+        count = poller.poll_once()
+
+        assert count == 0
+        assert q.depth() == 0
+
+    def test_skipped_items_still_advance_cursor(self):
+        """
+        A skipped item (non-blocked task) sandwiched between two enqueued items
+        must not stall the cursor — the cursor advances to the latest timestamp
+        seen across all processed items, enqueued or skipped.
+        """
+        items = [
+            _make_item("W-T005", item_type="epic", updated_at="2025-07-06T10:00:00+00:00"),
+            _make_item("W-T006", item_type="task", status="Open", updated_at="2025-07-06T11:00:00+00:00"),
+            _make_item("W-T007", item_type="epic", updated_at="2025-07-06T12:00:00+00:00"),
+        ]
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient(items)
+        poller = GusPoller(client, q, cursor)
+
+        count = poller.poll_once()
+
+        assert count == 2
+        assert q.depth() == 2
+        expected_ts = datetime(2025, 7, 6, 12, 0, 0, tzinfo=timezone.utc)
+        assert cursor.get() == expected_ts
+
+
+# ---------------------------------------------------------------------------
+# BUG 2 — Rate limiting: GusPoller must throttle calls to the GusClient to
+# at most MAX_REQUESTS_PER_SECOND, using an injectable clock/sleep so tests
+# never sleep for real.
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    """Deterministic fake clock: advances only when told to (e.g. via sleep)."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestRateLimiting:
+
+    def test_rate_limiter_does_not_sleep_for_first_call(self):
+        """The first acquire() call should never sleep — nothing to space against yet."""
+        clock = _FakeClock(start=100.0)
+        sleep_calls: list[float] = []
+        limiter = RateLimiter(
+            max_requests_per_second=10,
+            clock=clock,
+            sleep=sleep_calls.append,
+        )
+
+        limiter.acquire()
+
+        assert sleep_calls == []
+
+    def test_rate_limiter_sleeps_when_calls_are_too_close(self):
+        """
+        Two acquire() calls that arrive faster than 1/rate apart must sleep for
+        the remaining interval, using the injected sleep (no real time passes).
+        """
+        clock = _FakeClock(start=0.0)
+        sleep_calls: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            clock.now += seconds  # simulate time passing due to sleep
+
+        limiter = RateLimiter(
+            max_requests_per_second=10,  # min interval = 0.1s
+            clock=clock,
+            sleep=fake_sleep,
+        )
+
+        limiter.acquire()  # t=0, no sleep
+        clock.now = 0.02  # only 20ms later — too soon for a 100ms interval
+        limiter.acquire()
+
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == pytest.approx(0.08)
+
+    def test_rate_limiter_no_sleep_if_interval_already_elapsed(self):
+        """If enough real/simulated time has passed, acquire() should not sleep."""
+        clock = _FakeClock(start=0.0)
+        sleep_calls: list[float] = []
+        limiter = RateLimiter(
+            max_requests_per_second=10,  # min interval = 0.1s
+            clock=clock,
+            sleep=sleep_calls.append,
+        )
+
+        limiter.acquire()
+        clock.now = 5.0  # way more than 0.1s later
+        limiter.acquire()
+
+        assert sleep_calls == []
+
+    def test_poller_uses_injected_rate_limiter_between_client_calls(self):
+        """
+        GusPoller.poll_once() must call the rate limiter's acquire() before
+        hitting the GusClient, so repeated polling never exceeds the
+        configured rate. No real sleeping occurs — the fake sleep just
+        advances the fake clock.
+        """
+        clock = _FakeClock(start=0.0)
+        sleep_calls: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            clock.now += seconds
+
+        limiter = RateLimiter(
+            max_requests_per_second=MAX_REQUESTS_PER_SECOND,  # 10/sec -> 0.1s min interval
+            clock=clock,
+            sleep=fake_sleep,
+        )
+
+        q = InMemoryQueue()
+        cursor = InMemoryCursorStore()
+        client = _FakeGusClient([])
+        poller = GusPoller(client, q, cursor, rate_limiter=limiter)
+
+        # Simulate 3 poll cycles arriving back-to-back (no real delay between them).
+        poller.poll_once()
+        poller.poll_once()
+        poller.poll_once()
+
+        # First call is free; the next two must each be throttled since no
+        # simulated time passed between poll_once() invocations.
+        assert len(sleep_calls) == 2
+        min_interval = 1.0 / MAX_REQUESTS_PER_SECOND
+        for wait in sleep_calls:
+            assert wait == pytest.approx(min_interval, abs=1e-6)
+        # Confirm the fake clock advanced by exactly the throttled amount —
+        # proof that no real time.sleep() occurred.
+        assert clock.now == pytest.approx(2 * min_interval)
+
+
+# ---------------------------------------------------------------------------
+# BUG 3 — Durable FileCursorStore: persists cursor to disk atomically and
+# round-trips across process restarts (simulated by creating a fresh
+# FileCursorStore instance pointed at the same path).
+# ---------------------------------------------------------------------------
+
+class TestFileCursorStore:
+
+    def test_round_trips_cursor_across_fresh_instance(self, tmp_path):
+        """A cursor written by one instance is loaded by a fresh instance at the same path."""
+        path = tmp_path / "cursor.json"
+        store1 = FileCursorStore(path)
+        ts = datetime(2025, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
+
+        store1.set(ts)
+
+        store2 = FileCursorStore(path)
+        assert store2.get() == ts
+
+    def test_missing_file_defaults_to_epoch(self, tmp_path):
+        """A FileCursorStore pointed at a nonexistent file falls back to the epoch default."""
+        path = tmp_path / "does-not-exist.json"
+        store = FileCursorStore(path)
+
+        assert store.get() == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def test_malformed_file_defaults_to_epoch_without_crashing(self, tmp_path):
+        """A malformed (non-JSON) cursor file must not crash init — falls back to epoch."""
+        path = tmp_path / "cursor.json"
+        path.write_text("{not valid json::")
+
+        store = FileCursorStore(path)
+
+        assert store.get() == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def test_write_is_atomic_no_leftover_tmp_file(self, tmp_path):
+        """After a successful set(), no temp file should remain alongside the cursor file."""
+        path = tmp_path / "cursor.json"
+        store = FileCursorStore(path)
+        ts = datetime(2025, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
+
+        store.set(ts)
+
+        assert path.exists()
+        leftover_tmp = path.with_suffix(path.suffix + ".tmp")
+        assert not leftover_tmp.exists()
+
+    def test_set_updates_get_immediately_on_same_instance(self, tmp_path):
+        """set() must update the in-memory cursor immediately, not just on disk."""
+        path = tmp_path / "cursor.json"
+        store = FileCursorStore(path)
+        ts = datetime(2025, 6, 1, 9, 30, 0, tzinfo=timezone.utc)
+
+        store.set(ts)
+
+        assert store.get() == ts
 
 
 # ---------------------------------------------------------------------------

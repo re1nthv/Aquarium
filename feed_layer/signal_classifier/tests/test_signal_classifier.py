@@ -29,7 +29,10 @@ from feed_layer.signal_classifier.classifier import (
     InMemoryHumanReviewQueue,
     InMemoryLLMClient,
     InMemoryMetricsCollector,
+    InMemoryTokenBudgetStore,
+    LLMClient,
     SignalClassifier,
+    TokenBudgetStore,
 )
 from feed_layer.signal_classifier.metrics_names import (
     LLM_FALLBACK_COUNT,
@@ -627,3 +630,285 @@ class TestInMemoryEmbedder:
         v = emb.embed("some text to embed here")
         magnitude = math.sqrt(sum(x * x for x in v))
         assert abs(magnitude - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# GAP 1: pre_filter_hit schema field population
+# ---------------------------------------------------------------------------
+
+
+class TestPreFilterHitRecorded:
+    def test_spam_bot_drop_records_rule_name_in_classification(self):
+        """A signal dropped by the giphy spam rule has
+        classification.pre_filter_hit == 'spam_bot' and result == 'irrelevant'.
+        """
+        classifier, input_q, output_q, human_q, metrics, config = make_classifier()
+        sig = make_signal(
+            source="slack",
+            signal_type="bot_message",
+            originator_name="giphy",
+        )
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert output_q.depth() == 0
+        assert sig.classification is not None
+        assert sig.classification.result == "irrelevant"
+        assert sig.classification.pre_filter_hit == "spam_bot"
+        assert sig.classification.prompt_version == config.prompt_version
+        assert sig.classification.classified_at is not None
+
+    def test_empty_content_drop_records_rule_name(self):
+        """A signal dropped for empty content also records pre_filter_hit."""
+        classifier, input_q, output_q, human_q, metrics, _ = make_classifier()
+        sig = make_signal(raw_content="")
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert sig.classification is not None
+        assert sig.classification.result == "irrelevant"
+        assert sig.classification.pre_filter_hit == "empty_content"
+
+    def test_gus_task_noise_drop_records_rule_name(self):
+        """A GUS task-noise drop records pre_filter_hit == 'gus_task_noise'."""
+        classifier, input_q, output_q, human_q, metrics, _ = make_classifier()
+        sig = make_gus_signal(signal_type="task.created")
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert sig.classification is not None
+        assert sig.classification.result == "irrelevant"
+        assert sig.classification.pre_filter_hit == "gus_task_noise"
+
+    def test_stale_parked_signal_records_rule_name(self):
+        """A stale-parked signal (>48h old) records pre_filter_hit == 'stale'
+        with result == 'uncertain' rather than a silent drop.
+        """
+        classifier, input_q, output_q, human_q, metrics, config = make_classifier()
+        ingested_at = _now() - timedelta(hours=49)
+        sig = make_signal(ingested_at=ingested_at)
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert human_q.depth() == 1
+        assert sig.classification is not None
+        assert sig.classification.result == "uncertain"
+        assert sig.classification.pre_filter_hit == "stale"
+        assert sig.classification.prompt_version == config.prompt_version
+        assert sig.classification.classified_at is not None
+
+
+# ---------------------------------------------------------------------------
+# GAP 2: date-aware, injectable token budget accounting
+# ---------------------------------------------------------------------------
+
+
+class TestTokenBudgetAccounting:
+    def test_tokens_used_accumulate_within_a_day(self):
+        """Multiple LLM calls on the same day accumulate against the same
+        budget key, eventually exhausting it.
+        """
+        responses = [
+            ("relevant", 60, 0.9),
+            ("relevant", 60, 0.9),
+            ("relevant", 60, 0.9),
+        ]
+        classifier, input_q, output_q, human_q, metrics, config = make_classifier(
+            llm_responses=responses, daily_token_budget=100
+        )
+        contents = [
+            "First unique signal content for budget accumulation test one",
+            "Second unique signal content for budget accumulation test two",
+            "Third unique signal content for budget accumulation test three",
+        ]
+        input_q.enqueue(make_signal(raw_content=contents[0]))
+        classifier.process_batch()
+        # First call consumes 60 of 100 tokens
+        assert config.daily_token_budget_remaining() == 40
+
+        input_q.enqueue(make_signal(raw_content=contents[1]))
+        classifier.process_batch()
+        # Second call consumes another 60, taking usage to 120/100 — budget
+        # accounting accumulates the actual usage even past the nominal cap.
+        assert config.daily_token_budget_remaining() == 0
+
+        # A third signal arrives once the budget shows zero remaining — the
+        # guard now engages and the signal is parked back in the queue
+        # rather than calling the LLM again.
+        input_q.enqueue(make_signal(raw_content=contents[2]))
+        classifier.process_batch()
+        assert input_q.depth() == 1
+        assert config.daily_token_budget_remaining() == 0
+
+    def test_crossing_day_boundary_resets_remaining_budget(self):
+        """An injected clock that reports a new date resets the effective
+        remaining budget even though the store instance is unchanged.
+        """
+        store = InMemoryTokenBudgetStore()
+        current_day = ["2026-07-08"]
+
+        config = ClassifierConfig(
+            daily_token_budget=100,
+            token_budget_store=store,
+            today=lambda: current_day[0],
+        )
+        input_q: InMemoryQueue = InMemoryQueue()
+        output_q: InMemoryQueue = InMemoryQueue()
+        human_q = InMemoryHumanReviewQueue()
+        metrics = InMemoryMetricsCollector()
+        classifier = SignalClassifier(
+            input_queue=input_q,
+            output_queue=output_q,
+            llm_client=InMemoryLLMClient(
+                responses=[("relevant", 100, 0.9), ("relevant", 100, 0.9)]
+            ),
+            embedder=InMemoryEmbedder(),
+            dedup_store=InMemoryDedupStore(),
+            human_queue=human_q,
+            metrics=metrics,
+            config=config,
+        )
+
+        input_q.enqueue(make_signal(raw_content="Day one signal content long enough here"))
+        classifier.process_batch()
+        # Budget for day one fully consumed
+        assert config.daily_token_budget_remaining() == 0
+
+        # A second signal on day one should be parked (budget exhausted).
+        input_q.enqueue(make_signal(raw_content="Day one second signal content long enough"))
+        classifier.process_batch()
+        assert input_q.depth() == 1
+        input_q.dequeue(batch_size=10)  # drain so it doesn't interfere below
+
+        # Cross the day boundary via the injected clock.
+        current_day[0] = "2026-07-09"
+        assert config.daily_token_budget_remaining() == 100
+
+        input_q.enqueue(make_signal(raw_content="Day two signal content long enough here"))
+        classifier.process_batch()
+        assert output_q.depth() == 2  # day-one signal + day-two signal forwarded
+
+    def test_durable_store_retains_usage_across_two_classifier_instances(self):
+        """A shared TokenBudgetStore persists usage even when a brand new
+        SignalClassifier/ClassifierConfig pair is constructed, simulating a
+        process restart against a durable backend.
+        """
+        shared_store = InMemoryTokenBudgetStore()
+        fixed_day = "2026-07-08"
+
+        def build():
+            input_q: InMemoryQueue = InMemoryQueue()
+            output_q: InMemoryQueue = InMemoryQueue()
+            human_q = InMemoryHumanReviewQueue()
+            metrics = InMemoryMetricsCollector()
+            config = ClassifierConfig(
+                daily_token_budget=150,
+                token_budget_store=shared_store,
+                today=lambda: fixed_day,
+            )
+            classifier = SignalClassifier(
+                input_queue=input_q,
+                output_queue=output_q,
+                llm_client=InMemoryLLMClient(responses=[("relevant", 100, 0.9)]),
+                embedder=InMemoryEmbedder(),
+                dedup_store=InMemoryDedupStore(),
+                human_queue=human_q,
+                metrics=metrics,
+                config=config,
+            )
+            return classifier, input_q, output_q, config
+
+        classifier1, input_q1, output_q1, config1 = build()
+        input_q1.enqueue(make_signal(raw_content="Instance one signal content long enough"))
+        classifier1.process_batch()
+        assert config1.daily_token_budget_remaining() == 50
+
+        # Brand new classifier + config instance, but same durable store —
+        # usage from "instance one" must still be reflected.
+        classifier2, input_q2, output_q2, config2 = build()
+        assert config2.daily_token_budget_remaining() == 50
+
+        input_q2.enqueue(make_signal(raw_content="Instance two signal content long enough"))
+        classifier2.process_batch()
+        # 100 (instance one) + 100 (instance two) = 200 > 150 budget, so the
+        # second call happened while remaining was 50 but consume_tokens
+        # still records actual usage against the shared store.
+        assert shared_store.get_tokens_used(fixed_day) == 200
+
+
+# ---------------------------------------------------------------------------
+# GAP 3: content truncation before LLM call
+# ---------------------------------------------------------------------------
+
+
+class _CapturingLLMClient(LLMClient):
+    """Stub LLM client that records the raw_content it was called with."""
+
+    def __init__(self) -> None:
+        self.seen_contents: list[str] = []
+
+    def classify(self, signal, prompt_version):
+        self.seen_contents.append(signal.raw_content)
+        return ("relevant", 100, 0.9)
+
+
+class TestContentTruncationBeforeLLM:
+    def test_over_long_content_is_truncated_for_llm(self):
+        """Content longer than max_llm_content_chars is truncated in the
+        text handed to the LLM, but the stored signal is left untouched.
+        """
+        capturing_llm = _CapturingLLMClient()
+        config = ClassifierConfig(max_llm_content_chars=50)
+        input_q: InMemoryQueue = InMemoryQueue()
+        output_q: InMemoryQueue = InMemoryQueue()
+        human_q = InMemoryHumanReviewQueue()
+        metrics = InMemoryMetricsCollector()
+        classifier = SignalClassifier(
+            input_queue=input_q,
+            output_queue=output_q,
+            llm_client=capturing_llm,
+            embedder=InMemoryEmbedder(),
+            dedup_store=InMemoryDedupStore(),
+            human_queue=human_q,
+            metrics=metrics,
+            config=config,
+        )
+
+        long_content = "x" * 500
+        sig = make_signal(raw_content=long_content)
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert len(capturing_llm.seen_contents) == 1
+        assert len(capturing_llm.seen_contents[0]) == 50
+        assert capturing_llm.seen_contents[0] == long_content[:50]
+        # The stored signal's raw_content must be unchanged.
+        assert sig.raw_content == long_content
+        assert len(sig.raw_content) == 500
+
+    def test_short_content_passed_unchanged(self):
+        """Content shorter than the max length is passed to the LLM as-is."""
+        capturing_llm = _CapturingLLMClient()
+        config = ClassifierConfig(max_llm_content_chars=2000)
+        input_q: InMemoryQueue = InMemoryQueue()
+        output_q: InMemoryQueue = InMemoryQueue()
+        human_q = InMemoryHumanReviewQueue()
+        metrics = InMemoryMetricsCollector()
+        classifier = SignalClassifier(
+            input_queue=input_q,
+            output_queue=output_q,
+            llm_client=capturing_llm,
+            embedder=InMemoryEmbedder(),
+            dedup_store=InMemoryDedupStore(),
+            human_queue=human_q,
+            metrics=metrics,
+            config=config,
+        )
+
+        short_content = "This short signal content should pass through untouched."
+        sig = make_signal(raw_content=short_content)
+        input_q.enqueue(sig)
+        classifier.process_batch()
+
+        assert capturing_llm.seen_contents == [short_content]
+        assert sig.raw_content == short_content

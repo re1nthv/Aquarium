@@ -27,6 +27,10 @@ class SlackMetadata:
     thread_ts: Optional[str] = None
     reaction: Optional[str] = None
     bot_name: Optional[str] = None
+    reactor_id: Optional[str] = None
+    """Slack user id of the reactor, for manual_reaction signals. Used to
+    disambiguate multiple reactors on the same message_ts when a reaction is
+    withdrawn (see feed_layer.slack.connector._remove_signal_by_ts)."""
 
 
 @dataclass

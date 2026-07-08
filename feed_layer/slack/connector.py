@@ -26,7 +26,10 @@ create_app() accepts:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -41,6 +44,49 @@ from feed_layer.shared import (
 from . import config as _default_config
 
 logger = logging.getLogger(__name__)
+
+# Slack rejects (and we mirror) requests whose timestamp header is older than
+# this many seconds — replay-attack protection per Slack's signing spec.
+_MAX_REQUEST_AGE_SECONDS = 60 * 5
+
+
+# ---------------------------------------------------------------------------
+# Request signature verification
+# ---------------------------------------------------------------------------
+
+def _verify_slack_signature(
+    signing_secret: str,
+    timestamp: Optional[str],
+    raw_body: bytes,
+    signature: Optional[str],
+) -> bool:
+    """Verify a Slack request per https://api.slack.com/authentication/verifying-requests-from-slack.
+
+    Returns True when the signing secret is empty/None (verification
+    disabled — used in tests and local dev without a configured secret).
+    Otherwise verifies both the HMAC signature and that the timestamp is
+    within _MAX_REQUEST_AGE_SECONDS of now (replay protection).
+    """
+    if not signing_secret:
+        return True
+
+    if not timestamp or not signature:
+        return False
+
+    try:
+        request_time = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+
+    if abs(time.time() - request_time) > _MAX_REQUEST_AGE_SECONDS:
+        return False
+
+    basestring = f"v0:{timestamp}:{raw_body.decode('utf-8')}".encode("utf-8")
+    computed = "v0=" + hmac.new(
+        signing_secret.encode("utf-8"), basestring, hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(computed, signature)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +157,15 @@ def create_app(
     @app.post("/slack/events")
     def slack_events() -> tuple[Response, int]:
         """Handle all inbound Slack events."""
+        if not _verify_slack_signature(
+            signing_secret=cfg["SLACK_SIGNING_SECRET"],
+            timestamp=request.headers.get("X-Slack-Request-Timestamp"),
+            raw_body=request.get_data(),
+            signature=request.headers.get("X-Slack-Signature"),
+        ):
+            logger.warning("Rejected Slack event: signature verification failed")
+            return jsonify({"error": "invalid signature"}), 401
+
         body: dict[str, Any] = request.get_json(silent=True) or {}
 
         # -- URL verification challenge ------------------------------------
@@ -183,6 +238,7 @@ def _handle_reaction_added(
             message_ts=message_ts,
             thread_ts=thread_ts if thread_ts else None,
             reaction=reaction_name,
+            reactor_id=reactor_id,
         ),
     )
 
@@ -202,8 +258,11 @@ def _handle_reaction_removed(
 ) -> tuple[Response, int]:
     """Process a reaction_removed event.
 
-    Removes any queued Signal whose metadata.message_ts matches the
-    unreacted message and that has not yet been dequeued by the classifier.
+    Removes the queued Signal whose metadata.message_ts AND reactor_id match
+    the unreacted message/user, and that has not yet been dequeued by the
+    classifier. Matching on reactor_id (in addition to message_ts) ensures
+    that when multiple users react to the same message, one user removing
+    their reaction only withdraws their own signal — not everyone else's.
     This makes the gate a toggle, not a latch.
     """
     reaction_name: str = event.get("reaction", "")
@@ -212,12 +271,13 @@ def _handle_reaction_removed(
 
     item: dict[str, Any] = event.get("item", {})
     message_ts: str = item.get("ts", "")
+    reactor_id: str = event.get("user", "")
 
     # InMemoryQueue (and any compliant queue) exposes its internal list or a
     # remove_if method.  We use duck-typing: if the queue has a _queue
     # attribute we mutate it directly; otherwise we call remove_signal if
     # present; otherwise we silently no-op (idempotent).
-    _remove_signal_by_ts(queue, message_ts)
+    _remove_signal_by_ts(queue, message_ts, reactor_id)
 
     return jsonify({"ok": True}), 200
 
@@ -324,12 +384,17 @@ def _fetch_message_content(
     return text, thread_ts
 
 
-def _remove_signal_by_ts(queue: MessageQueue, message_ts: str) -> None:
-    """Remove any Signal whose metadata.message_ts matches, if still queued.
+def _remove_signal_by_ts(queue: MessageQueue, message_ts: str, reactor_id: str) -> None:
+    """Remove the Signal whose (message_ts, reactor_id) matches, if still queued.
+
+    Matching on reactor_id in addition to message_ts prevents a race where
+    two users react to the same message and one withdrawing their reaction
+    incorrectly removes both queued signals — only the withdrawing user's
+    own signal should be dropped.
 
     Works with InMemoryQueue by directly mutating _queue. For other queue
-    implementations, calls remove_signal(message_ts) if that method exists.
-    Falls back to no-op so removal is always idempotent.
+    implementations, calls remove_signal(message_ts, reactor_id) if that
+    method exists. Falls back to no-op so removal is always idempotent.
     """
     if hasattr(queue, "_queue"):
         # InMemoryQueue path: mutate in-place
@@ -338,10 +403,11 @@ def _remove_signal_by_ts(queue: MessageQueue, message_ts: str) -> None:
             if not (
                 isinstance(s.metadata, SlackMetadata)
                 and s.metadata.message_ts == message_ts
+                and s.metadata.reactor_id == reactor_id
             )
         ]
     elif hasattr(queue, "remove_signal"):
-        queue.remove_signal(message_ts)  # type: ignore[attr-defined]
+        queue.remove_signal(message_ts, reactor_id)  # type: ignore[attr-defined]
     # else: silently no-op — idempotent
 
 

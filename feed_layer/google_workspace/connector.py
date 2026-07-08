@@ -41,13 +41,24 @@ class DriveClient(ABC):
     """
 
     @abstractmethod
-    def list_changes(self, page_token: str) -> list[dict]:
-        """Return a list of change dicts since *page_token*.
+    def list_changes(self, page_token: str) -> dict:
+        """Return the changes since *page_token* together with the new cursor.
 
-        Each dict must contain at minimum:
+        Return shape: {"changes": list[dict], "new_page_token": str}
+
+        Each change dict must contain at minimum:
           fileId  : str
           file    : dict  (the file resource — may be absent for removals)
           removed : bool
+
+        ``new_page_token`` is the token callers must persist and pass to the
+        *next* call to ``list_changes`` — this is how the Drive Changes API
+        signals that a page of changes has been consumed.  Without advancing
+        it, callers would re-query the same page and reprocess changes.
+
+        For backward compatibility, callers (see ``_unpack_changes_result``)
+        also accept a bare ``list[dict]`` (legacy shape, no new token) or a
+        ``(changes, new_page_token)`` tuple.
         """
 
     @abstractmethod
@@ -219,6 +230,39 @@ def _build_signal(file_meta: dict, content: str, folder_id: str) -> Signal:
 
 
 # ---------------------------------------------------------------------------
+# list_changes() result normalization
+# ---------------------------------------------------------------------------
+
+
+def _unpack_changes_result(
+    result: object, fallback_page_token: str
+) -> tuple[list[dict], str]:
+    """Normalize the return value of DriveClient.list_changes().
+
+    Supports three shapes, from newest/preferred to legacy:
+      - dict:   {"changes": [...], "new_page_token": "..."}
+      - tuple:  (changes, new_page_token)
+      - list:   changes only (legacy) — page token does not advance.
+
+    Returns (changes, new_page_token). If no new token is available,
+    *fallback_page_token* (the token that was requested) is returned so
+    callers don't accidentally clear their cursor.
+    """
+    if isinstance(result, dict):
+        changes = result.get("changes", [])
+        new_page_token = result.get("new_page_token", fallback_page_token)
+        return changes, new_page_token
+
+    if isinstance(result, tuple):
+        changes = result[0] if len(result) > 0 else []
+        new_page_token = result[1] if len(result) > 1 else fallback_page_token
+        return changes, new_page_token
+
+    # Legacy shape: bare list of changes, no new token available.
+    return list(result), fallback_page_token  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # _file_qualifies helper
 # ---------------------------------------------------------------------------
 
@@ -292,10 +336,16 @@ def create_app(
             return "", 200
 
         try:
-            changes = drive_client.list_changes(state["page_token"])
+            raw_result = drive_client.list_changes(state["page_token"])
         except Exception:
             logger.exception("gdrive_notify: list_changes failed")
             return "", 200
+
+        changes, new_page_token = _unpack_changes_result(raw_result, state["page_token"])
+        # Persist the new cursor immediately so a clustered follow-up
+        # notification (or a crash mid-loop) doesn't re-query this same
+        # page and reprocess changes already seen here.
+        state["page_token"] = new_page_token
 
         for change in changes:
             file_resource = change.get("file", {})
@@ -369,20 +419,48 @@ class WatchChannelRenewer:
     def renew_if_needed(self) -> bool:
         """Renew the watch channel if it expires within 1 day.
 
-        Returns True if a renewal was performed, False otherwise.
+        Returns True if a renewal was performed *and succeeded*, False
+        otherwise — including the case where renewal was attempted but the
+        underlying Drive API call failed.  A failed renewal never raises:
+        per the connector's delivery-guarantee contract, renewal is a
+        best-effort background job and the poller is the fallback path if
+        the watch channel eventually lapses.  Because expiry is left
+        untouched on failure, the next call to ``renew_if_needed`` will
+        attempt renewal again.
         """
         now = datetime.now(tz=timezone.utc)
         if self._channel_expiry - now <= timedelta(days=1):
-            self._do_renew()
-            return True
+            return self._do_renew()
         return False
 
-    def _do_renew(self) -> None:
-        """Call the Drive API to renew the watch channel."""
-        self._client.renew_watch_channel(self._channel_id, expiry_days=self._expiry_days)
+    def _do_renew(self) -> bool:
+        """Call the Drive API to renew the watch channel.
+
+        Returns True on success, False if the renewal call raised. On
+        failure, ``_channel_expiry`` is left unchanged so the failure is
+        retried on the next ``renew_if_needed()`` call instead of being
+        silently treated as a successful renewal.
+        """
+        try:
+            self._client.renew_watch_channel(
+                self._channel_id, expiry_days=self._expiry_days
+            )
+        except Exception:
+            # Do not log document content or other PII — only the channel
+            # id (an opaque identifier we generated) and the fact that
+            # renewal failed.
+            logger.warning(
+                "watch_channel_renew_failed: channel=%s — will retry on next "
+                "renew_if_needed() call; falling back to polling in the "
+                "interim",
+                self._channel_id,
+            )
+            return False
+
         self._channel_expiry = datetime.now(tz=timezone.utc) + timedelta(
             days=self._expiry_days
         )
+        return True
 
 
 # ---------------------------------------------------------------------------

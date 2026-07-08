@@ -4,97 +4,78 @@ Parent: [progress_tracker/](../README.md)
 
 | Sub-module | Status | Notes |
 |---|---|---|
-| slack | 🟢 Complete | Implemented + 17 tests passing |
-| gus | 🟢 Complete | Implemented + 23 tests passing |
-| google_workspace | 🟢 Complete | Implemented + 25 tests passing |
-| signal_classifier | 🟢 Complete | Implemented + 27 tests passing |
+| slack | 🟢 Complete | Implemented + hardened — 24 tests passing |
+| gus | 🟢 Complete | Implemented + hardened — 37 tests passing |
+| google_workspace | 🟢 Complete | Implemented + hardened — 33 tests passing |
+| signal_classifier | 🟢 Complete | Implemented + hardened — 36 tests passing |
 
-**Layer status: 🟢 Complete — 92/92 tests passing**
+**Layer status: 🟢 Complete — 130/130 tests passing**
 
 ---
 
 ## Sub-module Detail
 
-### slack — 🟡 In Progress
-**Design complete. Implementation not started.**
+### slack — 🟢 Complete
+**Design complete. Implemented, tested, and hardened.**
 
-**What is defined:**
-- Trigger: `reaction_added` (emoji gate, toggle via `reaction_removed`) + `message` with `is_bot: true`
-- Signal schema v1.0 with all fields specified
-- Delivery guarantee: async enqueue, HTTP 200 on receipt
-- Dedup anchor: `message_ts`
-- NLP handshake path explicitly deferred
+**What is built:**
+- Webhook endpoint (`/slack/events`) — returns 200, enqueues asynchronously; 503 on queue failure
+- `reaction_added` emoji gate + `reaction_removed` toggle for signal withdrawal
+- Bot message listener using the `is_bot` flag, scoped to monitored channels
+- Signal normalisation into canonical schema v1.0 (thread context captured)
+- NLP handshake path deferred as designed
 
-**What needs to be built:**
-- Slack app registration and OAuth scopes (`reactions:read`, `channels:history`, `channels:read`)
-- Webhook endpoint (returns 200, enqueues to message queue)
-- `reaction_removed` handler for signal withdrawal
-- Signal normalisation into canonical schema
-- Bot message listener with `is_bot` flag check
-- Message queue integration
+**Hardening (2026-07-08):**
+- Slack request signature verification — HMAC-SHA256 over `v0:{ts}:{body}`, 5-minute replay window, 401 on failure; skipped when no signing secret is configured (backward compatible)
+- Multi-reaction race fixed — removal now matches on (`message_ts`, `reactor_id`) via new optional `SlackMetadata.reactor_id`, so one user withdrawing no longer drops another's signal
 
 ---
 
-### gus — 🟡 In Progress
-**Design complete. Implementation not started.**
+### gus — 🟢 Complete
+**Design complete. Implemented, tested, and hardened.**
 
-**What is defined:**
-- Trigger: webhooks for `epic.*`, `td.*`, `escalation.created`, `task.blocked`; polling fallback with durable cursor; manual `aquarium-intake` label path
-- Signal schema v1.0 with all fields specified
-- Polling semantics: 5-minute interval, watermark cursor, crash recovery, overlap guard, rate limit
-- Rapid-update collapse: 60-second window per item
+**What is built:**
+- Webhook endpoint for `epic.*`, `td.*`, `escalation.created`, `task.blocked` (status-gated), and the `aquarium-intake` manual label
+- `GusPoller` fallback (5-minute interval) with watermark cursor and crash-safe per-item advancement
+- 60-second rapid-update collapse per item
+- Signal normalisation into canonical schema v1.0
 
-**What needs to be built:**
-- GUS webhook registration for subscribed event types
-- Webhook endpoint (returns 200, enqueues)
-- Polling job with durable cursor store
-- `aquarium-intake` label listener
-- Signal normalisation into canonical schema
-- Message queue integration
+**Hardening (2026-07-08):**
+- Polling task gate — task items produce a `task.blocked` signal only when `status == "Blocked"`; other tasks and unknown item types are skipped (previously mis-typed as `task.blocked`/`epic.updated`)
+- `RateLimiter` — min-interval throttle with injectable clock/sleep, wired into the poller per `MAX_REQUESTS_PER_SECOND`
+- `FileCursorStore` — durable cursor with atomic JSON write and epoch fallback on missing/malformed file (survives restart)
 
 ---
 
-### google_workspace — 🟡 In Progress
-**Design complete. Implementation not started.**
+### google_workspace — 🟢 Complete
+**Design complete. Implemented, tested, and hardened.**
 
-**What is defined:**
-- Trigger: Drive API watch on intake folder; `[READY]` title suffix as the ready convention
-- Signal schema v1.0 with all fields specified
-- Watch channel renewal: scheduled job every 6 days
-- Polling fallback: 15-minute interval
-- Access model: read-only service account scoped to intake folder
-- 403 handling: log and do not retry
+**What is built:**
+- Drive watch webhook (`/gdrive/notify`) on the intake folder with `[READY]` suffix gate (both conditions required)
+- `WatchChannelRenewer` (6-day renewal ahead of 7-day expiry) and `GWSPoller` fallback (15-minute interval, cursor persistence)
+- Document body fetch, 5-minute file-id dedup, 403 log-and-skip handling
+- Signal normalisation into canonical schema v1.0
 
-**What needs to be built:**
-- Google service account creation and Drive folder scoping
-- Drive watch channel setup and renewal job
-- `[READY]` suffix filter logic
-- Document body fetch (Docs API / export)
-- Polling fallback job with durable cursor
-- Signal normalisation into canonical schema
-- Message queue integration
+**Hardening (2026-07-08):**
+- `page_token` now advanced after each `list_changes` (backward-compatible dict/tuple/legacy-list return shapes) to stop duplicate processing on clustered notifications
+- Watch-channel renewal failures caught — logged, expiry not advanced, retried next cycle instead of propagating
 
 ---
 
-### signal_classifier — 🟡 In Progress
-**Design complete. Implementation not started.**
+### signal_classifier — 🟢 Complete
+**Design complete. Implemented, tested, and hardened.**
 
-**What is defined:**
-- Trigger: queue consumer (pull-based, batch 10, multiple workers)
-- Step 1: rule-based pre-filter (empty content, known-spam bots, stale signals)
-- Step 2: cross-source semantic dedup (embedding similarity, cosine > 0.92, 2-hour window)
-- Step 3: LLM classification (`relevant | irrelevant | uncertain`), versioned prompt, daily token budget, fallback on LLM unavailability
-- Step 4: forward/drop/park logic
-- Human review queue: 4-hour SLA, escalation path, feedback loop → 50-example prompt review trigger
-- 14 observability metrics defined
+**What is built:**
+- Queue consumer (pull-based, batch 10) running the 4-step pipeline
+- Step 1: rule-based pre-filter (empty/short content, spam bots, GUS task noise, stale signals)
+- Step 2: semantic dedup (embedding cosine > 0.92, 2-hour window, canonical-id linking)
+- Step 3: LLM classification (versioned prompt, daily token budget, 3-retry exponential backoff, park-on-unavailability)
+- Step 4: forward `relevant` / drop `irrelevant` / park `uncertain` to the human review queue
+- Observability metrics instrumented across the pipeline
 
-**What needs to be built:**
-- Message queue consumer workers
-- Rule-based pre-filter implementation
-- Embedding model integration for semantic dedup
-- Dedup store (vector store or similarity index with 2-hour TTL)
-- LLM integration with prompt v1, versioning, and token budget tracking
-- Human review queue store and moderator notification (Slack DM)
-- Feedback loop: labelled example store + 50-example accumulation trigger
-- Downstream enqueue to Task Management Layer
-- All 14 observability metrics instrumented
+**Hardening (2026-07-08):**
+- `pre_filter_hit` now populated on dropped/parked signals (audit trail of which rule fired)
+- Date-aware, injectable token budget (`TokenBudgetStore` + `InMemoryTokenBudgetStore`) — resets at day boundaries, swappable for a durable backend
+- Explicit raw_content truncation before the LLM call (`max_llm_content_chars`); the stored signal is never mutated
+
+**Deferred (external responsibilities, by design):** 4-hour SLA escalation, 50-example feedback-loop trigger, moderator Slack DM, and real LLM/embedding/store backends (currently in-memory stubs behind ABCs).

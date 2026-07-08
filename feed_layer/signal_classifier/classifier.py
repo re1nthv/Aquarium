@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from feed_layer.shared import (
     Classification,
@@ -114,6 +114,47 @@ class MetricsCollector(ABC):
         """Record a gauge metric."""
 
 
+class TokenBudgetStore(ABC):
+    """Abstract store for per-day LLM token usage.
+
+    Keying usage by calendar day (rather than an in-memory counter that
+    only resets on process restart) makes the daily budget durable across
+    restarts and swappable for a real backend (Redis, a DB row, etc.).
+    """
+
+    @abstractmethod
+    def get_tokens_used(self, day: str) -> int:
+        """Return the number of tokens consumed so far on *day* (YYYY-MM-DD)."""
+
+    @abstractmethod
+    def add_tokens(self, day: str, n: int) -> None:
+        """Record *n* additional tokens consumed on *day* (YYYY-MM-DD)."""
+
+
+class InMemoryTokenBudgetStore(TokenBudgetStore):
+    """Default in-memory token budget store, keyed by ISO date string.
+
+    Usage lives for the lifetime of the process (same as the old
+    ``_tokens_used_today`` counter), but is now keyed by day so it can be
+    swapped for a durable backend without changing classifier code, and so
+    a day boundary naturally resets the count for a fresh key.
+    """
+
+    def __init__(self) -> None:
+        self._usage: dict[str, int] = {}
+
+    def get_tokens_used(self, day: str) -> int:
+        return self._usage.get(day, 0)
+
+    def add_tokens(self, day: str, n: int) -> None:
+        self._usage[day] = self._usage.get(day, 0) + n
+
+
+def _utc_today_iso() -> str:
+    """Default clock — today's date (UTC) as an ISO ``YYYY-MM-DD`` string."""
+    return datetime.now(tz=timezone.utc).date().isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -127,16 +168,34 @@ class ClassifierConfig:
         default_factory=lambda: ["giphy", "polly"]
     )
     daily_token_budget: int = 100_000
+    # Approximate char-based cap standing in for "~2,000 tokens" (README),
+    # using a rough 4 chars/token heuristic. Only the copy of raw_content
+    # handed to the LLM is truncated; the stored Signal is never mutated.
+    max_llm_content_chars: int = 8_000
+    # Swappable persistence for daily token usage — defaults to an
+    # in-memory store so existing callers/tests see identical behaviour.
+    token_budget_store: TokenBudgetStore = field(
+        default_factory=InMemoryTokenBudgetStore
+    )
+    # Injectable clock returning today's date as an ISO string. Defaults to
+    # real UTC "today" so budget accounting resets at real date boundaries;
+    # tests can override this to simulate crossing a day boundary.
+    today: Callable[[], str] = field(default=_utc_today_iso)
+    # Deprecated / vestigial: retained only so any code that pokes this
+    # private attribute directly (e.g. older tests) doesn't break. It is no
+    # longer read by daily_token_budget_remaining()/consume_tokens(), which
+    # now delegate to token_budget_store keyed by today().
     _tokens_used_today: int = field(default=0, repr=False)
 
     def daily_token_budget_remaining(self) -> int:
         """Return how many tokens remain in today's budget."""
-        remaining = self.daily_token_budget - self._tokens_used_today
+        used = self.token_budget_store.get_tokens_used(self.today())
+        remaining = self.daily_token_budget - used
         return max(0, remaining)
 
     def consume_tokens(self, n: int) -> None:
-        """Deduct *n* tokens from the daily budget."""
-        self._tokens_used_today += n
+        """Deduct *n* tokens from today's budget."""
+        self.token_budget_store.add_tokens(self.today(), n)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +455,12 @@ class SignalClassifier:
             ingested = ingested.replace(tzinfo=timezone.utc)
         age_hours = (now - ingested).total_seconds() / 3600
         if age_hours > 48:
+            signal.classification = Classification(
+                result="uncertain",
+                prompt_version=self._config.prompt_version,
+                classified_at=datetime.now(tz=timezone.utc),
+                pre_filter_hit="stale",
+            )
             self._human.add(signal, reason="stale")
             return True, None  # parked, not silently dropped
 
@@ -445,10 +510,21 @@ class SignalClassifier:
         delays = [1, 2, 4]
         last_exc: Optional[Exception] = None
 
+        # Truncate a *copy* of the signal's raw_content before handing it to
+        # the LLM (README: raw content truncated to ~2,000 tokens). The
+        # stored signal object is never mutated — only the copy passed to
+        # the LLM client is shortened.
+        llm_signal = signal
+        max_chars = self._config.max_llm_content_chars
+        if signal.raw_content and len(signal.raw_content) > max_chars:
+            llm_signal = replace(
+                signal, raw_content=signal.raw_content[:max_chars]
+            )
+
         for attempt, delay in enumerate(delays):
             try:
                 result, tokens_used, confidence = self._llm.classify(
-                    signal, prompt_version=self._config.prompt_version
+                    llm_signal, prompt_version=self._config.prompt_version
                 )
                 # Track token usage
                 self._metrics.increment(LLM_TOKENS_USED, tokens_used)
@@ -479,11 +555,20 @@ class SignalClassifier:
         should_drop, rule = self.pre_filter(signal)
         if should_drop:
             if rule is not None:
-                # Silently dropped — emit metric
+                # Silently dropped — emit metric and record the rule that
+                # fired so the drop reason is auditable on the signal itself.
                 self._metrics.increment(
                     SIGNALS_PRE_FILTER_DROPPED, tags={"rule": rule}
                 )
-            # If rule is None the signal was parked (stale) — no drop metric
+                signal.classification = Classification(
+                    result="irrelevant",
+                    prompt_version=self._config.prompt_version,
+                    classified_at=datetime.now(tz=timezone.utc),
+                    pre_filter_hit=rule,
+                )
+            # If rule is None the signal was parked (stale) — pre_filter()
+            # already attached an "uncertain" classification with
+            # pre_filter_hit="stale" above.
             self._input.ack(signal.id)
             return
 

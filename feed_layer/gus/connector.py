@@ -7,16 +7,22 @@ Path 2: GusPoller background thread using a GusClient abstraction
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import threading
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional, Union
 
 from flask import Flask, request, jsonify
 
 from feed_layer.shared import Signal, GusMetadata, Originator, MessageQueue
-from .config import RAPID_UPDATE_WINDOW_SECONDS
+from .config import MAX_REQUESTS_PER_SECOND, RAPID_UPDATE_WINDOW_SECONDS
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +59,52 @@ class InMemoryCursorStore(CursorStore):
         return self._cursor
 
     def set(self, ts: datetime) -> None:
+        self._cursor = ts
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class FileCursorStore(CursorStore):
+    """
+    Durable cursor store that persists the cursor as JSON on disk.
+
+    Writes are atomic: the new value is written to a temp file in the same
+    directory and then moved into place with os.replace, so a crash mid-write
+    never corrupts the committed cursor file.
+
+    If the file is missing or malformed on load, the cursor falls back to
+    the epoch (1970-01-01T00:00:00+00:00) rather than raising.
+    """
+
+    def __init__(self, path: Union[str, Path]) -> None:
+        self._path = Path(path)
+        self._cursor: datetime = self._load()
+
+    def _load(self) -> datetime:
+        try:
+            raw = self._path.read_text()
+        except (FileNotFoundError, OSError):
+            return _EPOCH
+        try:
+            data = json.loads(raw)
+            return datetime.fromisoformat(data["cursor"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.warning("Malformed cursor file at %s — falling back to epoch", self._path)
+            return _EPOCH
+
+    def get(self) -> datetime:
+        return self._cursor
+
+    def set(self, ts: datetime) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+        payload = json.dumps({"cursor": ts.isoformat()})
+        with open(tmp_path, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self._path)
         self._cursor = ts
 
 
@@ -123,8 +175,40 @@ def _build_signal_from_payload(event_type: str, signal_type: str, payload: dict)
     )
 
 
-def _build_signal_from_polled_item(item: dict) -> Signal:
-    """Build a canonical Signal from a polled GUS item dict."""
+def _build_signal_from_polled_item(item: dict) -> Optional[Signal]:
+    """
+    Build a canonical Signal from a polled GUS item dict, or return None if
+    the item should be skipped (not ingested) during polling.
+
+    Per the README, task-level CRUD is excluded from ingestion — only tasks
+    whose status is "Blocked" are actionable and produce a task.blocked
+    signal. Items with an item_type we don't recognise are skipped rather
+    than silently mis-typed as epic.updated.
+    """
+    item_type = item.get("item_type", "task")
+    type_map = {
+        "epic": "epic.updated",
+        "td": "td.updated",
+        "team_dependency": "td.updated",
+        "escalation": "escalation.created",
+    }
+
+    if item_type.lower() == "task":
+        if item.get("status") != "Blocked":
+            # Task-level CRUD that isn't a Blocked status change — excluded
+            # from ingestion per the connector's design.
+            return None
+        signal_type = "task.blocked"
+    else:
+        signal_type = type_map.get(item_type.lower())
+        if signal_type is None:
+            logger.warning(
+                "Skipping polled item %s with unrecognised item_type=%r",
+                item.get("gus_item_id", "<unknown>"),
+                item_type,
+            )
+            return None
+
     now = _now_utc()
     raw_ts = item.get("updated_at") or item.get("created_at")
     if isinstance(raw_ts, str):
@@ -133,17 +217,6 @@ def _build_signal_from_polled_item(item: dict) -> Signal:
         timestamp = raw_ts
     else:
         timestamp = now
-
-    # Derive signal type from item_type
-    item_type = item.get("item_type", "task")
-    type_map = {
-        "epic": "epic.updated",
-        "td": "td.updated",
-        "team_dependency": "td.updated",
-        "escalation": "escalation.created",
-        "task": "task.blocked",
-    }
-    signal_type = type_map.get(item_type.lower(), "epic.updated")
 
     return Signal(
         source="gus",
@@ -298,6 +371,51 @@ def create_app(queue: MessageQueue) -> Flask:
 
 
 # ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """
+    Minimal min-interval rate limiter: blocks callers of acquire() so that
+    calls are spaced at least 1 / max_requests_per_second apart.
+
+    The clock and sleep functions are injectable so tests can assert
+    throttling behaviour deterministically without real sleeping.
+    """
+
+    def __init__(
+        self,
+        max_requests_per_second: float,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._min_interval = (
+            1.0 / max_requests_per_second if max_requests_per_second > 0 else 0.0
+        )
+        self._clock = clock
+        self._sleep = sleep
+        self._last_call: Optional[float] = None
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block (via the injected sleep) until it is safe to make the next call."""
+        with self._lock:
+            if self._min_interval <= 0:
+                return
+            now = self._clock()
+            if self._last_call is None:
+                self._last_call = now
+                return
+            earliest_next = self._last_call + self._min_interval
+            wait = earliest_next - now
+            if wait > 0:
+                self._sleep(wait)
+                self._last_call = earliest_next
+            else:
+                self._last_call = now
+
+
+# ---------------------------------------------------------------------------
 # GusPoller
 # ---------------------------------------------------------------------------
 
@@ -312,10 +430,12 @@ class GusPoller:
         gus_client: GusClient,
         queue: MessageQueue,
         cursor_store: CursorStore,
+        rate_limiter: Optional[RateLimiter] = None,
     ) -> None:
         self._client = gus_client
         self._queue = queue
         self._cursor_store = cursor_store
+        self._rate_limiter = rate_limiter or RateLimiter(MAX_REQUESTS_PER_SECOND)
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
@@ -325,19 +445,26 @@ class GusPoller:
 
     def poll_once(self) -> int:
         """
-        Fetch items modified after the cursor, enqueue each, and advance
-        the cursor after each successful enqueue.
+        Fetch items modified after the cursor, enqueue each non-skipped
+        item, and advance the cursor for every item processed (skipped or
+        enqueued) so polling never stalls on excluded items.
 
-        Returns the number of signals successfully enqueued.
+        Returns the number of signals successfully enqueued (skipped items
+        do not count).
         """
         since = self._cursor_store.get()
+        self._rate_limiter.acquire()
         items = self._client.fetch_items_since(since)
 
         count = 0
         for item in items:
             signal = _build_signal_from_polled_item(item)
-            self._queue.enqueue(signal)
-            # Advance cursor after each successful enqueue
+            if signal is not None:
+                self._queue.enqueue(signal)
+                count += 1
+            # Advance cursor for every processed item, enqueued or skipped,
+            # so skipped items (e.g. non-blocked tasks) never stall the
+            # cursor and cause re-fetching on the next poll.
             raw_ts = item.get("updated_at") or item.get("created_at")
             if raw_ts is not None:
                 if isinstance(raw_ts, str):
@@ -346,7 +473,6 @@ class GusPoller:
                     item_ts = raw_ts
                 if item_ts > self._cursor_store.get():
                     self._cursor_store.set(item_ts)
-            count += 1
 
         return count
 
